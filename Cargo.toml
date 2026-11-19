@@ -1,0 +1,16 @@
+[package]
+name = "exobox-tcb"
+version = "0.0.0"
+description = "Lockdown for an in-process sandbox: checks the process's threads, fds and mappings, drops what it may not keep, and installs one seccomp filter"
+# Its own repository-to-be: nothing here is inherited from a workspace.
+edition = "2024"
+rust-version = "1.88"
+license = "GPL-2.0-only"
+
+[dependencies]
+# The filter's allowlist, compiled to classic BPF (src/filter.rs): Firecracker's
+seccompiler = "0.5"
+# Lockdown's syscalls and constants
+libc = "0.2"
+
+[dev-dependencies]
