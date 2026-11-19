@@ -1,5 +1,5 @@
 # Exobox TCB
-This repo contains the trusted computing base for exobox. It is extracted from the main repo to keep a very concise, readable implementation guarantee of the security sandbox: about 800 lines of source including comments (`src/lib.rs`, `src/filter.rs`, `src/lockdown.rs`), with two dependencies, `seccompiler` and `libc`.
+This repo contains the trusted computing base for exobox. It is extracted from the main repo to keep a very concise, readable implementation guarantee of the security sandbox: about 610 lines of source including comments (`src/lib.rs`, `src/filter.rs`, `src/lockdown.rs`), with two dependencies, [`seccomp-fn`](https://github.com/ryanrasti1/seccomp-fn) and `libc`.
 
 
 ## TCB & Guarantees
@@ -7,7 +7,7 @@ After `Sandbox::configure_and_lockdown()` returns, the current process can use t
   (a) its configured syscalls (see below for the default modes which pin arguments), on the fds granted to it: every other fd is closed, and no allowed syscall opens one
   (b) its memory mappings, none of which can write outside the sandbox (i.e., each is private, read-only, or (fork mode only) anonymous memory shared among the sandbox's own processes)
 
-Access is enforced by seccomp, with three configurations, one per mode ([`table()`](src/filter.rs)):
+Access is enforced by seccomp, with three configurations, one per mode ([`policy()`](src/filter.rs)):
 1. `coroutine`: every guest thread runs on one host thread
 2. `threaded`: a host thread per guest thread, taking turns on one guest CPU
 3. `fork`: as threaded, and a guest fork is a host fork; the processes share one guest kernel
@@ -25,10 +25,16 @@ Access is enforced by seccomp, with three configurations, one per mode ([`table(
 Anything else kills the process.
 
 The complete TCB then includes:
-- seccomp being correctly implemented by your Linux kernel
-- `/proc/self/{task,fd,maps}` correctly pointing to the current process (part of the lockdown check)
-- the Rust toolchain, `libc` (constants, raw syscalls), and `seccompiler` (the allowlist's compiler: checked against a plain model of the table above, `tests/filter.rs`)
-- hardware
+- This crate: the policy (`src/filter.rs`) being the intended one, and lockdown's checks (`src/lockdown.rs`). TODO: the whole crate as one `src/lib.rs` (with `#[seccomp]` it should be very small)
+- [`seccomp-fn`](https://github.com/ryanrasti1/seccomp-fn): compiles the policy to BPF, proven equal to it (its own README lists what that rests on)
+- Toolchain correctness:
+  - `rustc`
+  - `libc` (constants, raw syscalls)
+- Minimal Linux kernel surface:
+  - `/proc/self/{task,fd,maps}` correctly pointing to the current process (part of the lockdown check)
+  - seccomp implementation
+  - each kept fd honouring its own mode, and private mappings staying private
+- Hardware
 
 ## Not guaranteed
 - **Memory contents**: everything in the address space at lockdown is readable by the current process. Hold no secrets in memory before lockdown.
@@ -49,13 +55,13 @@ The guarantee is achieved at the end of `Sandbox::configure_and_lockdown()` by, 
 
 Nothing untrusted has run if lockdown fails: the caller reports the error.
 
-The filter is seccompiler's allowlist behind one hand-written check: a call not made from exobox's one syscall instruction (the gate) gets TRAP, and is served inside the process. That check never returns ALLOW, so whatever it decides, only the allowlist reaches the host.
+The filter is `policy()`, one Rust function: the gate check, then the table's rows. A call not made from exobox's one syscall instruction (the gate) gets TRAP, and is served inside the process; that check never returns ALLOW, so whatever it decides, only the rows reach the host. `seccomp-fn` compiles the function to BPF, and Kani proves the program gives the function's verdict for every call and every configuration.
 
 ## Review checklist
 | Guarantee | Where | Verify |
 |---|---|---|
-| allowlist | `src/filter.rs` `table()` | each row pins every argument it needs; nothing creates an fd or a mapping |
-| gate check | `src/filter.rs` `gate_check()` | returns only TRAP or KILL |
+| policy | `src/filter.rs` `policy()` | is the intended policy: the gate check returns only TRAP or KILL; each row pins every argument it needs; nothing creates an fd or a mapping |
+| proof | `src/filter.rs` (`#[seccomp]`) | `cargo kani -p exobox-tcb` proves `policy_is_its_bpf_*`, one per mode; the release build depends on it |
 | one thread | `src/lockdown.rs` | counted before any other check |
 | fds | `src/lockdown.rs` | the guest's kinds checked; everything else closed |
 | mappings | `src/lockdown.rs` | no writable shared mapping of a file |
