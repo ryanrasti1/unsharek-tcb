@@ -1,10 +1,11 @@
 # Exobox TCB
-This repo contains the trusted computing base for exobox.
+This repo contains the trusted computing base for exobox. It is extracted from the main repo to keep a very concise, readable implementation guarantee of the security sandbox: about 800 lines of source including comments (`src/lib.rs`, `src/filter.rs`, `src/lockdown.rs`), with two dependencies, `seccompiler` and `libc`.
+
 
 ## TCB & Guarantees
-After calling `Sandbox::configure_and_lockdown()` returns, the current process can use the host kernel only through:
+After `Sandbox::configure_and_lockdown()` returns, the current process can use the host kernel only through:
   (a) its configured syscalls (see below for the default modes which pin arguments, including fds)
-  (b) its memory mappings, nothing of which can write outside the sandbox (i.e., each is private, read-only, or anonymous memory shared among the sandbox's own processes)
+  (b) its memory mappings, none of which can write outside the sandbox (i.e., each is private, read-only, or (fork mode only) anonymous memory shared among the sandbox's own processes)
 
 Access is enforced by seccomp, with three configurations, one per mode ([`rules()`](src/filter.rs)):
 1. `coroutine`: every guest thread runs on one host thread
@@ -25,14 +26,15 @@ Anything else kills the process.
 
 The complete TCB then includes:
 - seccomp being correctly implemented by your Linux kernel
--  `/proc/self/{task,fd,maps}` correctly pointing to the current process (part of the lockdown check)
+- `/proc/self/{task,fd,maps}` correctly pointing to the current process (part of the lockdown check)
+- the Rust toolchain, `libc` (constants, raw syscalls), and `seccompiler` (the allowlist's compiler: checked against an independent one in 2.3M cases, `src/filter/tests.rs`)
 - hardware
 
 ## Not guaranteed
 - **Memory contents**: everything in the address space at lockdown is readable by the current process. Hold no secrets in memory before lockdown.
 - **Denial of service**: CPU, memory, and process counts are the caller's to bound (rlimits, cgroups).
 - **Code before lockdown** is trusted: it runs with the host's authority. Lockdown verifies only what it leaves behind.
- - **Side channels.** :this is a caller concern
+- **Side channels**: the caller's concern.
 
 # Design
 The guarantee is achieved at the end of `Sandbox::configure_and_lockdown()` by, in order:
