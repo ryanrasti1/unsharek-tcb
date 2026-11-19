@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::filter::{self, SockFilter};
-use crate::{Access, Config, Confined, Error, Mode, Result};
+use crate::{Config, Confined, Error, Mode, Result};
 
 fn os(what: &'static str) -> impl FnOnce(io::Error) -> Error {
     move |source| Error::Os { what, source }
@@ -32,10 +32,10 @@ pub(crate) fn lockdown<C: Confined + ?Sized>(config: Config, guest: &C) -> Resul
     let mode = config.mode;
     let guest_fds: Vec<RawFd> = guest.host_fds().to_vec();
     let grants = config.fds.clone();
-    // The filter's fds: the grants, and the guest's read and write. Compiled first: it
-    // allocates, and checks nothing.
+    // The kept fds: the grants, and the guest's. The filter is compiled first: it allocates,
+    // and checks nothing.
     let mut all = config;
-    all.fds.extend(guest_fds.iter().map(|&fd| (fd, Access::ReadWrite)));
+    all.fds.extend(guest_fds.iter().copied());
     // SAFETY: getpid.
     let pid = unsafe { libc::getpid() } as u32;
     let prog = filter::filter(&all, pid, guest.gate_ip()).map_err(|e| Error::Filter(e.to_string()))?;
@@ -58,7 +58,7 @@ pub(crate) fn lockdown<C: Confined + ?Sized>(config: Config, guest: &C) -> Resul
             return Err(Error::FdKind { fd, kind });
         }
     }
-    for &(fd, _) in &grants {
+    for &fd in &grants {
         // SAFETY: fcntl on an fd number, which may not be open.
         if fd < 0 || unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
             return Err(Error::NotOpen(fd));
@@ -68,7 +68,7 @@ pub(crate) fn lockdown<C: Confined + ?Sized>(config: Config, guest: &C) -> Resul
     check_maps(mode)?;
     // 4. Every other fd closed, not refused (a CLI inherits stray fds): between and above the
     // kept ones.
-    let mut keep: Vec<RawFd> = all.fds.iter().map(|&(fd, _)| fd).collect();
+    let mut keep: Vec<RawFd> = all.fds.clone();
     keep.sort_unstable();
     keep.dedup();
     close_except(&keep)?;

@@ -19,14 +19,13 @@
 //! There is one filter; no `prctl`, `seccomp` or syscall-user-dispatch rule is in it.
 
 use std::collections::BTreeMap;
-use std::os::fd::RawFd;
 
 use seccompiler::{
     BpfProgram, SeccompAction, SeccompCmpArgLen as Len, SeccompCmpOp as Op, SeccompCondition as Cond,
     SeccompFilter, SeccompRule, TargetArch,
 };
 
-use crate::{Access, Config, Mode};
+use crate::{Config, Mode};
 
 /// One classic-BPF instruction (`struct sock_filter`, include/uapi/linux/filter.h).
 #[repr(C)]
@@ -66,26 +65,6 @@ fn rule(conds: Vec<Cond>) -> SeccompRule {
     SeccompRule::new(conds).expect("a rule with conditions")
 }
 
-/// The fds `access` allows `nr` on (`read` for [`Access::Read`] and [`Access::ReadWrite`], `write`
-/// for the other two), as inclusive runs of consecutive fds: one rule per run, so a guest's 129
-/// token eventfds (made one after the other) are one comparison pair, not 129.
-fn runs(fds: &[(RawFd, Access)], write: bool) -> Vec<(u64, u64)> {
-    let mut v: Vec<u64> = fds
-        .iter()
-        .filter(|(fd, a)| *fd >= 0 && if write { a.writes() } else { a.reads() })
-        .map(|&(fd, _)| fd as u64)
-        .collect();
-    v.sort_unstable();
-    v.dedup();
-    let mut out: Vec<(u64, u64)> = vec![];
-    for fd in v {
-        match out.last_mut() {
-            Some((_, hi)) if *hi + 1 == fd => *hi = fd,
-            _ => out.push((fd, fd)),
-        }
-    }
-    out
-}
 
 /// When a row allows its syscall: always (any arguments), or when one of its rules holds (none:
 /// never). The two differ on purpose: to seccompiler an empty rule list is "any arguments".
@@ -99,11 +78,6 @@ const ALL: &[Mode] = &[Mode::Coroutine, Mode::Threaded, Mode::Fork];
 const THREADS: &[Mode] = &[Mode::Threaded, Mode::Fork];
 const FORK: &[Mode] = &[Mode::Fork];
 
-/// `read` or `write` on the fds the grants allow it on: one rule per run of consecutive fds.
-fn on_fds(config: &Config, write: bool) -> Allow {
-    let conds = |(lo, hi)| if lo == hi { vec![eq(0, lo)] } else { within(0, lo, hi) };
-    Allow::When(runs(&config.fds, write).into_iter().map(|r| rule(conds(r))).collect())
-}
 
 /// The allowlist, README.md's table row by row: everything a mode's runtime makes and nothing
 /// else. Each row widens what a compromised program can do through the gate, so each says why.
@@ -114,10 +88,11 @@ fn table(config: &Config, pid: u32) -> Vec<(i64, Allow, &'static [Mode])> {
     let mut ppoll = within(1, 0, config.ppoll_max);
     ppoll.push(eq(3, 0));
     vec![
-        // The granted fds and the guest's own, with the access each was granted (stdio among them,
-        // as the caller granted it; the CPU tokens' eventfds, blocked on and handed over).
-        (READ, on_fds(config, false), ALL),
-        (WRITE, on_fds(config, true), ALL),
+        // Any fd: only the kept ones are open (lockdown closed the rest), and no row can open
+        // another (nothing here makes an fd), so a number reaches a kept fd or none. Each moves
+        // data only as its own mode allows. Pinning numbers here would repeat `close_range`.
+        (READ, Allow::Always, ALL),
+        (WRITE, Allow::Always, ALL),
         // The one wait: idle to the next timer, a thread's timed sleep on its eventfd, the fds it
         // waits for. Up to `ppoll_max` pollfds and no signal mask (a mask would let the gate change
         // the host's blocked signals, SIGSYS among them). Which fds can't be pinned (they are in

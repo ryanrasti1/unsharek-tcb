@@ -11,7 +11,7 @@
 //! (SIGSYS, served by the guest).
 //!
 //! ```no_run
-//! use exobox_tcb::{Access, Confined, Mode, Sandbox};
+//! use exobox_tcb::{Confined, Mode, Sandbox};
 //! # struct Guest;
 //! # impl Confined for Guest {
 //! #     fn host_fds(&self) -> &[std::os::fd::RawFd] { &[] }
@@ -21,7 +21,7 @@
 //! Sandbox::configure_and_lockdown(
 //!     |s| {
 //!         s.mode = Mode::Coroutine;
-//!         s.grant(0, Access::Read).grant(1, Access::Write).grant(2, Access::Write);
+//!         s.grant(0).grant(1).grant(2);
 //!         Ok(())
 //!     },
 //!     &guest,
@@ -40,7 +40,7 @@
 //!     loop {
 //!         let conn = accept()?;                     // the template's work
 //!         if unsafe { libc::fork() } == 0 {         // the instance
-//!             s.grant(conn, Access::ReadWrite);
+//!             s.grant(conn);
 //!             return Ok(());
 //!         }
 //!         // the template: close its copy of `conn`, reap children, loop
@@ -85,24 +85,6 @@ pub enum Mode {
     Fork,
 }
 
-/// What may be done on a granted fd: `read`, `write`, or both. Nothing else ever is (no `ioctl`,
-/// no `sendmsg`, no `close`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Access {
-    Read,
-    Write,
-    ReadWrite,
-}
-
-impl Access {
-    fn reads(self) -> bool {
-        self != Access::Write
-    }
-    fn writes(self) -> bool {
-        self != Access::Read
-    }
-}
-
 /// The guest whose program runs after lockdown: what lockdown asks of it. Nothing it says is
 /// trusted to widen the filter: its fds are checked for kind, and the gate's address only sends
 /// other calls back as TRAP.
@@ -122,9 +104,12 @@ pub trait Confined {
 pub struct Config {
     /// Which allowlist: the guest's mode.
     pub mode: Mode,
-    /// The fds kept past lockdown, and what may be done on each. Fds 0-2 are granted like any
-    /// other (none is by default).
-    pub fds: Vec<(RawFd, Access)>,
+    /// The fds kept open past lockdown; every other one is closed. Fds 0-2 are granted like any
+    /// other (none is by default). What may be done on one is `read` and `write`, as its own mode
+    /// allows (an `O_RDONLY` file can't be written; a pipe end is one-way), and nothing else (no
+    /// `ioctl`, no `sendmsg`, no `close`). A two-way fd the program should only write (a terminal
+    /// as stdout) is the caller's to reopen one-way first.
+    pub fds: Vec<RawFd>,
     /// The most pollfds one `ppoll` may pass: at least what the guest waits on at once.
     pub ppoll_max: u64,
 }
@@ -136,10 +121,9 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Keep host fd `fd` open past lockdown, with `access` on it ([`Config::fds`]). Granting one
-    /// fd twice grants the union.
-    pub fn grant(&mut self, fd: RawFd, access: Access) -> &mut Self {
-        self.fds.push((fd, access));
+    /// Keep host fd `fd` open past lockdown ([`Config::fds`]).
+    pub fn grant(&mut self, fd: RawFd) -> &mut Self {
+        self.fds.push(fd);
         self
     }
 }

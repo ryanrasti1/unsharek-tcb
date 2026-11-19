@@ -7,7 +7,7 @@
 
 use std::os::fd::RawFd;
 
-use exobox_tcb::{Access, CLONE_THREAD_FLAGS, Config, Mode, PPOLL_FDS, RET_ALLOW, RET_KILL_PROCESS, RET_TRAP, SockFilter, filter};
+use exobox_tcb::{CLONE_THREAD_FLAGS, Config, Mode, PPOLL_FDS, RET_ALLOW, RET_KILL_PROCESS, RET_TRAP, SockFilter, filter};
 
 const GATE: u64 = 0x0000_7f12_3456_7890;
 const PID: u32 = 4242;
@@ -41,20 +41,13 @@ fn gate(nr: u32, args: [u64; 6]) -> Data {
 // ------------------------------------------------------------------------------------------------
 // The model.
 
-/// What may be done on `fd`, from `config.fds` (a fd granted twice: the union).
-fn access(config: &Config, fd: u64) -> (bool, bool) {
-    config.fds.iter().filter(|&&(f, _)| f >= 0 && f as u64 == fd).fold((false, false), |(r, w), &(_, a)| {
-        (r || a != Access::Write, w || a != Access::Read)
-    })
-}
 
 /// README.md's table, row by row.
 fn allowed(config: &Config, pid: u32, nr: u32, a: [u64; 6]) -> bool {
     let threads = config.mode != Mode::Coroutine;
     let fork = config.mode == Mode::Fork;
     match nr {
-        READ => access(config, a[0]).0,
-        WRITE => access(config, a[0]).1,
+        READ | WRITE => true,
         PPOLL => a[1] <= config.ppoll_max && a[3] == 0,
         KILL => a[0] == pid as u64 && (1..=64).contains(&a[1]),
         EXIT_GROUP | RT_SIGRETURN => true,
@@ -152,8 +145,8 @@ fn probes(ranges: &[(u64, u64)]) -> Vec<u64> {
 }
 
 /// `fds`' numbers as runs of consecutive fds: their edges are what a rule can get wrong.
-fn runs(fds: &[(RawFd, Access)]) -> Vec<(u64, u64)> {
-    let mut v: Vec<u64> = fds.iter().map(|&(f, _)| f as u64).collect();
+fn runs(fds: &[RawFd]) -> Vec<(u64, u64)> {
+    let mut v: Vec<u64> = fds.iter().map(|&f| f as u64).collect();
     v.sort_unstable();
     v.dedup();
     let mut out: Vec<(u64, u64)> = vec![];
@@ -166,16 +159,15 @@ fn runs(fds: &[(RawFd, Access)]) -> Vec<(u64, u64)> {
     out
 }
 
-/// The configurations checked: stdio as exobox grants it, a run of guest token fds, passed fds
-/// (one read-only, one write-only), and three `ppoll_max`es.
+/// The configurations checked: stdio as exobox grants it, a run of guest token fds, passed fds,
+/// and three `ppoll_max`es. (The fds don't change the filter, which allows `read` and `write` on
+/// any: they are here to show it.)
 fn configs(mode: Mode) -> Vec<Config> {
-    let stdio = vec![(0, Access::Read), (1, Access::Write), (2, Access::Write)];
-    let tokens: Vec<(RawFd, Access)> =
-        if mode == Mode::Coroutine { vec![] } else { (3..=131).map(|fd| (fd, Access::ReadWrite)).collect() };
-    let mut a = Config { mode, fds: stdio.clone(), ppoll_max: PPOLL_FDS };
+    let tokens: Vec<RawFd> = if mode == Mode::Coroutine { vec![] } else { (3..=131).collect() };
+    let mut a = Config { mode, fds: vec![0, 1, 2], ppoll_max: PPOLL_FDS };
     a.fds.extend(tokens.iter().copied());
     let mut b = a.clone();
-    b.fds.extend([(1000, Access::ReadWrite), (1001, Access::Read), (1003, Access::Write), (0x7fff_ffff, Access::ReadWrite)]);
+    b.fds.extend([1000, 1001, 1003, 0x7fff_ffff]);
     b.ppoll_max = 3;
     let c = Config { mode, fds: vec![], ppoll_max: 0 };
     vec![a, b, c]

@@ -6,7 +6,7 @@
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
-use exobox_tcb::{Access, Config, Confined, Error, Mode, Sandbox};
+use exobox_tcb::{Config, Confined, Error, Mode, Sandbox};
 
 // ------------------------------------------------------------------------------------------------
 // A gate, and a SIGSYS handler that returns through it.
@@ -162,7 +162,7 @@ fn locks_down_and_probes() {
             install_handler();
             let guest = Guest { fds: vec![efd], mode };
             let r = lockdown(&guest, |s| {
-                s.grant(1, Access::Write).grant(2, Access::Write).grant(ro_fd, Access::Read);
+                s.grant(1).grant(2).grant(ro_fd);
             });
             if r.is_err() {
                 return 1;
@@ -205,16 +205,14 @@ fn locks_down_and_probes() {
     }
 }
 
-/// Each refused call from the gate kills the process with SIGSYS: a write on a read-only grant,
-/// a read of stdin (not granted), getppid, openat.
+/// Each refused call from the gate kills the process with SIGSYS: getppid, openat, socket.
 #[test]
 fn each_refused_call_kills() {
     type Probe = fn(RawFd) -> (i64, [usize; 3]);
-    let probes: [Probe; 4] = [
-        |ro| (libc::SYS_write, [ro as usize, 0, 0]),
-        |_| (libc::SYS_read, [0, 0, 0]),
+    let probes: [Probe; 3] = [
         |_| (libc::SYS_getppid, [0, 0, 0]),
         |_| (libc::SYS_openat, [libc::AT_FDCWD as usize, c"/".as_ptr() as usize, 0]),
+        |_| (libc::SYS_socket, [libc::AF_INET as usize, libc::SOCK_STREAM as usize, 0]),
     ];
     for (i, probe) in probes.into_iter().enumerate() {
         let status = in_child(|| {
@@ -222,7 +220,7 @@ fn each_refused_call_kills() {
             let ro_fd = ro.as_raw_fd();
             let guest = Guest { fds: vec![], mode: Mode::Coroutine };
             if lockdown(&guest, |s| {
-                s.grant(ro_fd, Access::Read);
+                s.grant(ro_fd);
             })
             .is_err()
             {
@@ -254,7 +252,7 @@ fn no_core_dumps() {
         let guest = Guest { fds: vec![], mode: Mode::Coroutine };
         let ok = Sandbox::configure_and_lockdown(
             |s| {
-                s.grant(p[0], Access::Read).grant(q[1], Access::Write);
+                s.grant(p[0]).grant(q[1]);
                 Ok(())
             },
             &guest,
@@ -428,7 +426,7 @@ fn refuses_a_closed_grant() {
     let got = exit_code(in_child(|| {
         match Sandbox::configure_and_lockdown(
             |s| {
-                s.grant(900, Access::Read);
+                s.grant(900);
                 Ok(())
             },
             &Guest { fds: vec![], mode: Mode::Coroutine },

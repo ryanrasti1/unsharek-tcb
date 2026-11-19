@@ -4,7 +4,7 @@ This repo contains the trusted computing base for exobox. It is extracted from t
 
 ## TCB & Guarantees
 After `Sandbox::configure_and_lockdown()` returns, the current process can use the host kernel only through:
-  (a) its configured syscalls (see below for the default modes which pin arguments, including fds)
+  (a) its configured syscalls (see below for the default modes which pin arguments), on the fds granted to it: every other fd is closed, and no allowed syscall opens one
   (b) its memory mappings, none of which can write outside the sandbox (i.e., each is private, read-only, or (fork mode only) anonymous memory shared among the sandbox's own processes)
 
 Access is enforced by seccomp, with three configurations, one per mode ([`table()`](src/filter.rs)):
@@ -14,7 +14,7 @@ Access is enforced by seccomp, with three configurations, one per mode ([`table(
 
 | Syscall | Allowed when | Modes |
 |---|---|---|
-| `read`, `write` | the fd is granted, with that access | all |
+| `read`, `write` | any fd: only granted ones are open, and nothing can open more (as each fd's own mode allows) | all |
 | `ppoll` | at most 8 fds, no signal mask (readiness only: moves no data) | all |
 | `kill` | the sandbox's own pid, a signal number (ends it as a native death by that signal would) | all |
 | `exit_group`, `rt_sigreturn` | always | all |
