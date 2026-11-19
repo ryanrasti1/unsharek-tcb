@@ -2,11 +2,9 @@
 This repo contains the trusted computing base for exobox.
 
 ## TCB & Guarantees
-After `Sandbox::configure_and_lockdown()` returns, the current process can use the host kernel only through:
-  (a) its mode's allowlist of syscalls, each argument pinned; any fd they take must be granted, and is usable only with its granted access (read, write, or both)
-  (b) its memory mappings, every one of which is private, read-only, or (fork mode only) anonymous memory shared among the sandbox's own processes: no mapping writes anything outside the sandbox
-
-"Current process" is everything in it after lockdown: the program, the runtime, the guest kernel, the network hooks.
+After calling `Sandbox::configure_and_lockdown()` returns, the current process can use the host kernel only through:
+  (a) its configured syscalls (see below for the default modes which pin arguments, including fds)
+  (b) its memory mappings, nothing of which can write outside the sandbox (i.e., each is private, read-only, or anonymous memory shared among the sandbox's own processes)
 
 Access is enforced by seccomp, with three configurations, one per mode ([`rules()`](src/filter.rs)):
 1. `coroutine`: every guest thread runs on one host thread
@@ -25,14 +23,16 @@ Access is enforced by seccomp, with three configurations, one per mode ([`rules(
 
 Anything else kills the process.
 
-The complete TCB then includes seccomp being correctly implemented by your Linux kernel, `/proc` (lockdown reads `/proc/self/{task,fd,maps}`), and hardware.
+The complete TCB then includes:
+- seccomp being correctly implemented by your Linux kernel
+-  `/proc/self/{task,fd,maps}` correctly pointing to the current process (part of the lockdown check)
+- hardware
 
 ## Not guaranteed
 - **Memory contents**: everything in the address space at lockdown is readable by the current process. Hold no secrets in memory before lockdown.
 - **Denial of service**: CPU, memory, and process counts are the caller's to bound (rlimits, cgroups).
 - **Code before lockdown** is trusted: it runs with the host's authority. Lockdown verifies only what it leaves behind.
-- **Network hooks** are not a policy point: policy belongs at the far end of a granted fd.
-- **Side channels.**
+ - **Side channels.** :this is a caller concern
 
 # Design
 The guarantee is achieved at the end of `Sandbox::configure_and_lockdown()` by, in order:
