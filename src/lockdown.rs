@@ -42,6 +42,9 @@ pub(crate) fn lockdown<C: Confined + ?Sized>(config: Config, guest: &C) -> Resul
     let restrictions: Vec<Vec<SockFilter>> = config.restrictions.iter().map(|r| filter::restriction(r)).collect();
 
     let t = Instant::now();
+    // The checks read /proc/self: it must be the kernel's procfs, not whatever is mounted there
+    // (a FUSE or tmpfs at /proc could answer anything).
+    proc_is_procfs()?;
     // 1. One thread.
     one_thread()?;
     // 2. The guest's fds: an eventfd each (a CPU token), or in fork mode a pidfd (init's: each
@@ -93,6 +96,21 @@ pub(crate) fn lockdown<C: Confined + ?Sized>(config: Config, guest: &C) -> Resul
         install(r, false)?;
     }
     install(&prog, true)
+}
+
+/// `/proc/self` is on procfs (`PROC_SUPER_MAGIC`).
+fn proc_is_procfs() -> Result<()> {
+    const PROC_SUPER_MAGIC: libc::c_long = 0x9fa0;
+    // SAFETY: statfs into a local.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: a NUL-terminated path; the kernel writes `st`.
+    if unsafe { libc::statfs(c"/proc/self".as_ptr(), &mut st) } != 0 {
+        return Err(last_os("/proc/self"));
+    }
+    if st.f_type != PROC_SUPER_MAGIC {
+        return Err(Error::Os { what: "/proc", source: io::Error::other(format!("not procfs (f_type {:#x})", st.f_type)) });
+    }
+    Ok(())
 }
 
 /// Step 1. A thread just joined (exobox's image builders) is still listed while it finishes
