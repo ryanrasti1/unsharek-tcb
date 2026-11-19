@@ -1,5 +1,5 @@
 # Exobox TCB
-This repo contains the trusted computing base for exobox. It is extracted from the main repo to keep a very concise, readable implementation guarantee of the security sandbox: about 620 lines of source including comments (`src/lib.rs`, `src/filter.rs`, `src/lockdown.rs`), with two dependencies, `seccomp-fn` (the filter, a Rust function compiled to classic BPF and proven equal to it) and `libc`.
+This repo contains the trusted computing base for exobox. It is extracted from the main repo to keep a very concise, readable implementation guarantee of the security sandbox: about 800 lines of source including comments (`src/lib.rs`, `src/filter.rs`, `src/lockdown.rs`), with two dependencies, `seccompiler` and `libc`.
 
 
 ## TCB & Guarantees
@@ -7,7 +7,7 @@ After `Sandbox::configure_and_lockdown()` returns, the current process can use t
   (a) its configured syscalls (see below for the default modes which pin arguments), on the fds granted to it: every other fd is closed, and no allowed syscall opens one
   (b) its memory mappings, none of which can write outside the sandbox (i.e., each is private, read-only, or (fork mode only) anonymous memory shared among the sandbox's own processes)
 
-Access is enforced by seccomp, with three configurations, one per mode ([`policy()`](src/filter.rs)):
+Access is enforced by seccomp, with three configurations, one per mode ([`table()`](src/filter.rs)):
 1. `coroutine`: every guest thread runs on one host thread
 2. `threaded`: a host thread per guest thread, taking turns on one guest CPU
 3. `fork`: as threaded, and a guest fork is a host fork; the processes share one guest kernel
@@ -27,8 +27,7 @@ Anything else kills the process.
 The complete TCB then includes:
 - seccomp being correctly implemented by your Linux kernel
 - `/proc/self/{task,fd,maps}` correctly pointing to the current process (part of the lockdown check)
-- the Rust toolchain and `libc` (constants, raw syscalls)
-- Kani's proof that the filter's program is `policy()` (`cargo kani`), resting on seccomp-fn's `run_bpf` matching the kernel (checked against it: seccomp-fn's `tests/kernel.rs`)
+- the Rust toolchain, `libc` (constants, raw syscalls), and `seccompiler` (the allowlist's compiler: checked against a plain model of the table above, `tests/filter.rs`)
 - hardware
 
 ## Not guaranteed
@@ -50,13 +49,13 @@ The guarantee is achieved at the end of `Sandbox::configure_and_lockdown()` by, 
 
 Nothing untrusted has run if lockdown fails: the caller reports the error.
 
-The filter is one Rust function, `policy()`: another ABI is KILL; a call not made from exobox's one syscall instruction (the gate) gets TRAP, and is served inside the process; then the table above, a match arm per row, in its order. The gate check never returns ALLOW, so whatever it decides, only the rows reach the host. `#[seccomp]` compiles it to classic BPF, and Kani proves the program equal to it for every call and every mode, pid, `ppoll_max` and gate (`./test --prove`; the release build requires it).
+The filter is seccompiler's allowlist behind one hand-written check: a call not made from exobox's one syscall instruction (the gate) gets TRAP, and is served inside the process. That check never returns ALLOW, so whatever it decides, only the allowlist reaches the host.
 
 ## Review checklist
 | Guarantee | Where | Verify |
 |---|---|---|
-| the policy | `src/filter.rs` `policy()` | the ABI and gate checks return only KILL or TRAP; each row pins every argument it needs; nothing creates an fd or a mapping |
-| the proof | `cargo kani -p exobox-tcb` | `policy_is_its_bpf_*` pass (seccomp-fn's README: what the proof rests on) |
+| allowlist | `src/filter.rs` `table()` | each row pins every argument it needs; nothing creates an fd or a mapping |
+| gate check | `src/filter.rs` `gate_check()` | returns only TRAP or KILL |
 | one thread | `src/lockdown.rs` | counted before any other check |
 | fds | `src/lockdown.rs` | the guest's kinds checked; everything else closed |
 | mappings | `src/lockdown.rs` | no writable shared mapping of a file |
