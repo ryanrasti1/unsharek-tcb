@@ -19,16 +19,8 @@ use seccomp_fn::{SeccompData, SockFilter, seccomp};
 use crate::{Config, Mode};
 
 // The policy's constants, libc's.
+use libc::{SYS_clone, SYS_exit, SYS_exit_group, SYS_kill, SYS_ppoll, SYS_read, SYS_rt_sigreturn, SYS_write};
 pub use libc::{SECCOMP_RET_ALLOW, SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_TRAP};
-// `d.nr` is read unsigned (as BPF compares it): libc's numbers as u32, for the patterns.
-const SYS_read: u32 = libc::SYS_read as u32;
-const SYS_write: u32 = libc::SYS_write as u32;
-const SYS_exit_group: u32 = libc::SYS_exit_group as u32;
-const SYS_rt_sigreturn: u32 = libc::SYS_rt_sigreturn as u32;
-const SYS_ppoll: u32 = libc::SYS_ppoll as u32;
-const SYS_kill: u32 = libc::SYS_kill as u32;
-const SYS_clone: u32 = libc::SYS_clone as u32;
-const SYS_exit: u32 = libc::SYS_exit as u32;
 const SIGCHLD: u64 = libc::SIGCHLD as u64;
 const CLONE_PARENT: u64 = libc::CLONE_PARENT as u64;
 // Not in libc for x86_64:
@@ -64,7 +56,7 @@ pub fn policy(d: &SeccompData, mode: Mode, pid: u64, ppoll_max: u64, gate: u64) 
     }
     let threads = mode != Mode::Coroutine;
     let fork = mode == Mode::Fork;
-    match d.nr {
+    match d.nr as i64 {
         // Any fd: lockdown closed all but the kept ones, and no row makes another.
         SYS_read | SYS_write => SECCOMP_RET_ALLOW,
         // Readiness only, at most `ppoll_max` fds; no signal mask (it could unblock SIGSYS).
