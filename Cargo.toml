@@ -8,9 +8,12 @@ rust-version = "1.88"
 license = "GPL-2.0-only"
 
 [dependencies]
-# The filter's allowlist, compiled to classic BPF (src/filter.rs): Firecracker's
-seccompiler = "0.5"
+# The filter, a Rust function compiled to classic BPF and proven equal to it (src/filter.rs)
+seccomp-fn = { path = "../seccomp-fn/seccomp-fn" }
 # Lockdown's syscalls and constants
 libc = "0.2"
 
 [dev-dependencies]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

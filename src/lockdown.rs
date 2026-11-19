@@ -8,7 +8,9 @@ use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use crate::filter::{self, SockFilter};
+use seccomp_fn::{InstallError, SockFilter};
+
+use crate::filter;
 use crate::{Config, Confined, Error, Mode, Result};
 
 fn os(what: &'static str) -> impl FnOnce(io::Error) -> Error {
@@ -38,7 +40,7 @@ pub(crate) fn lockdown<C: Confined + ?Sized>(config: Config, guest: &C) -> Resul
     all.fds.extend(guest_fds.iter().copied());
     // SAFETY: getpid.
     let pid = unsafe { libc::getpid() } as u32;
-    let prog = filter::filter(&all, pid, guest.gate_ip()).map_err(|e| Error::Filter(e.to_string()))?;
+    let prog = filter::filter(&all, pid, guest.gate_ip());
 
     let t = Instant::now();
     // The checks read /proc/self: it must be the kernel's procfs, not whatever is mounted there
@@ -272,27 +274,12 @@ fn drop_capabilities() -> Result<()> {
     Ok(())
 }
 
-/// `struct sock_fprog`.
-#[repr(C)]
-struct SockFprog {
-    len: u16,
-    filter: *const SockFilter,
-}
-
 /// `insns` installed (`SECCOMP_SET_MODE_FILTER`), with TSYNC on every thread of the process (a
 /// failure to sync is lockdown's failure).
 fn install(insns: &[SockFilter]) -> Result<()> {
-    let len = u16::try_from(insns.len()).map_err(|_| Error::Filter(format!("{} instructions", insns.len())))?;
-    let fprog = SockFprog { len, filter: insns.as_ptr() };
-    let flags = libc::SECCOMP_FILTER_FLAG_TSYNC;
-    // SAFETY: seccomp reads `fprog` and the instructions, both live for the call.
-    let r = unsafe { libc::syscall(libc::SYS_seccomp, libc::SECCOMP_SET_MODE_FILTER, flags, &fprog as *const SockFprog) };
-    if r < 0 {
-        return Err(last_os("seccomp"));
-    }
-    // With TSYNC, a positive result is the id of a thread that couldn't be synced.
-    if r != 0 {
-        return Err(Error::Threads(vec![r as i32]));
-    }
-    Ok(())
+    seccomp_fn::install(insns, true).map_err(|e| match e {
+        InstallError::TooLong(n) => Error::Filter(format!("{n} instructions")),
+        InstallError::Os(source) => Error::Os { what: "seccomp", source },
+        InstallError::Thread(tid) => Error::Threads(vec![tid]),
+    })
 }

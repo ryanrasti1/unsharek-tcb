@@ -66,13 +66,18 @@ use std::os::fd::RawFd;
 mod filter;
 mod lockdown;
 
-pub use filter::{CLONE_THREAD_FLAGS, PPOLL_FDS, RET_ALLOW, RET_KILL_PROCESS, RET_TRAP, SockFilter, filter};
+pub use filter::{
+    AUDIT_ARCH_X86_64, CLONE_THREAD_FLAGS, PPOLL_FDS, SECCOMP_RET_ALLOW as RET_ALLOW, SECCOMP_RET_KILL_PROCESS as RET_KILL_PROCESS,
+    SECCOMP_RET_TRAP as RET_TRAP, X32_SYSCALL_BIT, filter, policy, policy_bpf, policy_constants,
+};
+pub use seccomp_fn::{SeccompData, SockFilter};
 #[doc(hidden)]
 pub use lockdown::{check_ns, map_ok};
 
 /// How the guest runs the program's threads and processes. Each mode's allowlist is a superset of
 /// the one before.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 pub enum Mode {
     /// One host thread.
     #[default]
@@ -83,6 +88,13 @@ pub enum Mode {
     /// (`MAP_SHARED | MAP_ANONYMOUS`, made before lockdown), which lockdown accepts in this mode
     /// only.
     Fork,
+}
+
+/// Every mode, for the filter's sampled test (`policy_matches_its_bpf_sampled`).
+impl seccomp_fn::Sample for Mode {
+    fn samples() -> Vec<Self> {
+        vec![Mode::Coroutine, Mode::Threaded, Mode::Fork]
+    }
 }
 
 /// The guest whose program runs after lockdown: what lockdown asks of it. Nothing it says is
@@ -145,7 +157,7 @@ pub enum Error {
     Mapping(String),
     /// A capability lockdown couldn't drop.
     Capabilities(String),
-    /// The filter didn't compile (a bad grant: a negative fd).
+    /// The filter is longer than the kernel takes.
     Filter(String),
     /// A syscall of lockdown's failed.
     Os { what: &'static str, source: std::io::Error },
