@@ -259,10 +259,13 @@ fn no_core_dumps() {
     assert_eq!(core.split_whitespace().nth(4), Some("0"), "{core}");
     assert_eq!(core.split_whitespace().nth(5), Some("0"), "{core}");
     // SAFETY: getuid.
-    if unsafe { libc::getuid() } != 0 {
+    let me = unsafe { libc::getuid() };
+    if me != 0 {
+        // Root's (the namespace's root: in a user namespace, as nix's build sandbox, it shows as
+        // the overflow uid), not ours.
         use std::os::unix::fs::MetadataExt;
         let owner = std::fs::metadata(format!("/proc/{pid}/limits")).unwrap().uid();
-        assert_eq!(owner, 0, "dumpable: /proc/{pid} is still its owner's");
+        assert_ne!(owner, me, "dumpable: /proc/{pid} is still its owner's");
     }
     // SAFETY: writes the parent's word, then waits.
     assert_eq!(unsafe { libc::write(p[1], b"x".as_ptr().cast(), 1) }, 1);
