@@ -601,3 +601,51 @@ fn installs_in_the_kernel() {
         assert_eq!(libc::WEXITSTATUS(status), 0, "{mode:?}");
     }
 }
+
+/// README.md's allowlist table is `rules()`: for each mode, the syscalls its rows name are
+/// exactly the numbers the filter has rules for, and the `ppoll` row's bound is [`PPOLL_FDS`].
+#[test]
+fn readme_table_is_the_filter() {
+    let readme = include_str!("../../README.md");
+    let nr = |name: &str| -> i64 {
+        match name {
+            "read" => libc::SYS_read,
+            "write" => libc::SYS_write,
+            "ppoll" => libc::SYS_ppoll,
+            "kill" => libc::SYS_kill,
+            "exit_group" => libc::SYS_exit_group,
+            "rt_sigreturn" => libc::SYS_rt_sigreturn,
+            "clone" => libc::SYS_clone,
+            "exit" => libc::SYS_exit,
+            n => panic!("README.md names a syscall the test doesn't know: {n}"),
+        }
+    };
+    let mut rows = 0;
+    for mode in MODES {
+        let name = match mode {
+            Mode::Coroutine => "coroutine",
+            Mode::Threaded => "threaded",
+            Mode::Fork => "fork",
+        };
+        let mut table = std::collections::BTreeSet::new();
+        for line in readme.lines().filter(|l| l.starts_with("| `")) {
+            let cells: Vec<&str> = line.split(" | ").collect();
+            let modes = cells.last().unwrap().trim_end_matches(" |").trim();
+            if modes == "all" || modes.split(", ").any(|m| m == name) {
+                for n in cells[0].trim_start_matches("| ").split(", ") {
+                    table.insert(nr(n.trim_matches('`')));
+                }
+            }
+            if mode == Mode::Coroutine {
+                rows += 1;
+                if cells[0].contains("`ppoll`") {
+                    assert!(cells[1].contains(&format!("at most {PPOLL_FDS} fds")), "{line}");
+                }
+            }
+        }
+        let p = Pins { pid: PID, fds: vec![(0, Access::Read), (1, Access::Write)] };
+        let filter: std::collections::BTreeSet<i64> = rules(mode, &p).keys().copied().collect();
+        assert_eq!(table, filter, "{mode:?}: README.md's table against rules()");
+    }
+    assert_eq!(rows, 7, "README.md's allowlist table: its rows");
+}

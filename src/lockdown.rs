@@ -1,5 +1,5 @@
 //! Lockdown: the moment the process stops being the host's. [`lockdown`] makes the steps of
-//! `Sandbox::configure_and_lockdown`'s comment, in its order, with ordinary syscalls (nothing
+//! `Sandbox::configure_and_lockdown`'s comment (and README.md's "Design"), in its order, with ordinary syscalls (nothing
 //! traps yet: no filter is in). The first check is the thread count, so nothing can open an fd,
 //! map memory or make a thread behind the later ones.
 
@@ -19,7 +19,7 @@ fn last_os(what: &'static str) -> Error {
     os(what)(io::Error::last_os_error())
 }
 
-/// How long the last lockdown's checks (steps 1-4: threads, fds, mappings) took, in ns: for
+/// How long the last lockdown's checks (steps 1-4: threads, fds, mappings, the close) took, in ns: for
 /// measuring, not a policy.
 static CHECK_NS: AtomicU64 = AtomicU64::new(0);
 
@@ -44,11 +44,15 @@ pub(crate) fn lockdown<C: Confined + ?Sized>(config: Config, guest: &C) -> Resul
     let t = Instant::now();
     // 1. One thread.
     one_thread()?;
-    // 2. The guest's fds: an eventfd or a pidfd each, nothing else (a file, a socket, a pipe
-    // posing as one would get read and write without the caller's grant).
+    // 2. The guest's fds: an eventfd each (a CPU token), or in fork mode a pidfd (init's: each
+    // forked process polls it to end with init; PR_SET_PDEATHSIG would need a prctl after
+    // lockdown, and the pidfd is only polled: no pidfd_send_signal or waitid is allowed).
+    // Nothing else: a file, a socket, a pipe posing as one would get read and write without the
+    // caller's grant.
     for &fd in &guest_fds {
         let kind = fd_kind(fd).map_err(|_| Error::NotOpen(fd))?;
-        if kind != "anon_inode:[eventfd]" && kind != "anon_inode:[pidfd]" {
+        let ok = kind == "anon_inode:[eventfd]" || (mode == Mode::Fork && kind == "anon_inode:[pidfd]");
+        if !ok {
             return Err(Error::FdKind { fd, kind });
         }
     }
@@ -58,13 +62,14 @@ pub(crate) fn lockdown<C: Confined + ?Sized>(config: Config, guest: &C) -> Resul
             return Err(Error::NotOpen(fd));
         }
     }
-    // 3. Every other fd closed: between and above the kept ones.
+    // 3. Every mapping.
+    check_maps(mode)?;
+    // 4. Every other fd closed, not refused (a CLI inherits stray fds): between and above the
+    // kept ones.
     let mut keep: Vec<RawFd> = pins.fds.iter().map(|&(fd, _)| fd).collect();
     keep.sort_unstable();
     keep.dedup();
     close_except(&keep)?;
-    // 4. Every mapping.
-    check_maps(mode)?;
     CHECK_NS.store(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     // 5. No core dump, not dumpable.
     let none = libc::rlimit { rlim_cur: 0, rlim_max: 0 };

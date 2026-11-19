@@ -1,6 +1,6 @@
 //! exobox-tcb: the lockdown of an in-process sandbox, and nothing else. The only code that
-//! protects the host from the program (`TCB.md`: the model, what is in it and what isn't, and a
-//! review checklist).
+//! protects the host from the current process after lockdown (README.md: the guarantee, what
+//! isn't guaranteed, the design and a review checklist).
 //!
 //! A process that runs an untrusted program in its own address space (exobox: a Linux kernel as a
 //! library, serving the program's syscalls from a SIGSYS handler) calls
@@ -120,7 +120,7 @@ impl Access {
 pub trait Confined {
     /// The guest's own host fds, kept past lockdown, read and write: its CPU tokens' eventfds
     /// (`anon_inode:[eventfd]`) and, in fork mode, init's pidfd (`anon_inode:[pidfd]`). Lockdown
-    /// refuses any other kind.
+    /// refuses any other kind (a pidfd in another mode too).
     fn host_fds(&self) -> &[RawFd];
     /// The mode, which decides the allowlist.
     fn mode(&self) -> Mode;
@@ -235,10 +235,11 @@ impl Sandbox {
     ///
     /// 1. exactly one thread, the caller's (`/proc/self/task`; a thread just joined gets a few ms
     ///    to vanish). Every check after this one can't be raced;
-    /// 2. the guest's own fds ([`Confined::host_fds`]) kind-checked: eventfds and pidfds only;
-    /// 3. every fd neither granted nor the guest's closed;
-    /// 4. every mapping kind-checked (`/proc/self/maps`): private, or shared and read-only, or (in
+    /// 2. the guest's own fds ([`Confined::host_fds`]) kind-checked: eventfds, and pidfds in fork
+    ///    mode only; every granted fd open;
+    /// 3. every mapping kind-checked (`/proc/self/maps`): private, or shared and read-only, or (in
     ///    fork mode) shared anonymous memory; above all no writable shared mapping of a host file;
+    /// 4. every fd neither granted nor the guest's closed (not refused: a CLI inherits stray fds);
     /// 5. no core dump (`RLIMIT_CORE` 0) and not dumpable (`PR_SET_DUMPABLE` 0): a crash makes the
     ///    host write none of the process's memory, nor start `core_pattern`'s helper;
     /// 6. every capability dropped (bounding where permitted, ambient, effective, permitted,

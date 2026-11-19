@@ -373,6 +373,13 @@ fn refuses_a_guest_fd_of_the_wrong_kind() {
         verdict(Sandbox::configure_and_lockdown(|_| Ok(()), &Guest { fds: vec![eventfd(), pidfd], mode: Mode::Fork }))
     }));
     assert_eq!(got, 0);
+    // A pidfd outside fork mode: refused (only fork mode's processes poll init's).
+    let got = exit_code(in_child(|| {
+        // SAFETY: a pidfd of this process.
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) } as RawFd;
+        verdict(Sandbox::configure_and_lockdown(|_| Ok(()), &Guest { fds: vec![pidfd], mode: Mode::Threaded }))
+    }));
+    assert_eq!(got, 2);
 }
 
 /// A second thread: refused, its tid named. Lockdown is then no further than step 1.
