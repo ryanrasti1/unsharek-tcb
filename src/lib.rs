@@ -15,12 +15,12 @@
 //! # struct Guest;
 //! # impl Confined for Guest {
 //! #     fn host_fds(&self) -> &[std::os::fd::RawFd] { &[] }
-//! #     fn mode(&self) -> Mode { Mode::Coroutine }
 //! #     fn gate_ip(&self) -> u64 { 0 }
 //! # }
 //! # let guest = Guest;
 //! Sandbox::configure_and_lockdown(
 //!     |s| {
+//!         s.mode = Mode::Coroutine;
 //!         s.grant(0, Access::Read).grant(1, Access::Write).grant(2, Access::Write);
 //!         Ok(())
 //!     },
@@ -66,9 +66,9 @@ use std::os::fd::RawFd;
 mod filter;
 mod lockdown;
 
-pub use filter::{CLONE_THREAD_FLAGS, PPOLL_FDS, SockFilter};
+pub use filter::{CLONE_THREAD_FLAGS, PPOLL_FDS, RET_ALLOW, RET_KILL_PROCESS, RET_TRAP, SockFilter, filter};
 #[doc(hidden)]
-pub use lockdown::check_ns;
+pub use lockdown::{check_ns, map_ok};
 
 /// How the guest runs the program's threads and processes. Each mode's allowlist is a superset of
 /// the one before.
@@ -83,17 +83,6 @@ pub enum Mode {
     /// (`MAP_SHARED | MAP_ANONYMOUS`, made before lockdown), which lockdown accepts in this mode
     /// only.
     Fork,
-}
-
-/// What the filter does to a call from the gate it doesn't allow.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Deny {
-    /// Kill the process (SIGSYS).
-    #[default]
-    Kill,
-    /// Fail the call with EPERM: for probing the filter (exobox's escape tests), never for a
-    /// sandbox.
-    Errno,
 }
 
 /// What may be done on a granted fd: `read`, `write`, or both. Nothing else ever is (no `ioctl`,
@@ -122,44 +111,35 @@ pub trait Confined {
     /// (`anon_inode:[eventfd]`) and, in fork mode, init's pidfd (`anon_inode:[pidfd]`). Lockdown
     /// refuses any other kind (a pidfd in another mode too).
     fn host_fds(&self) -> &[RawFd];
-    /// The mode, which decides the allowlist.
-    fn mode(&self) -> Mode;
     /// The address just past the gate's `syscall` instruction: the one place host calls are
     /// allowed from. Needn't be trusted: the gate check's verdicts are TRAP and KILL only.
     fn gate_ip(&self) -> u64;
 }
 
-/// The caller's side of lockdown, made in [`Sandbox::configure_and_lockdown`]'s callback.
-#[derive(Debug, Default)]
+/// The sandbox: everything the filter is made from ([`filter`]), set in
+/// [`Sandbox::configure_and_lockdown`]'s callback.
+#[derive(Clone, Debug)]
 pub struct Config {
-    grants: Vec<(RawFd, Access)>,
-    deny: Deny,
-    restrictions: Vec<Vec<SockFilter>>,
+    /// Which allowlist: the guest's mode.
+    pub mode: Mode,
+    /// The fds kept past lockdown, and what may be done on each. Fds 0-2 are granted like any
+    /// other (none is by default).
+    pub fds: Vec<(RawFd, Access)>,
+    /// The most pollfds one `ppoll` may pass: at least what the guest waits on at once.
+    pub ppoll_max: u64,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config { mode: Mode::default(), fds: vec![], ppoll_max: PPOLL_FDS }
+    }
 }
 
 impl Config {
-    /// Keep host fd `fd` open past lockdown, with `access` on it. Fds 0-2 are granted like any
-    /// other (none is by default). Granting one fd twice grants the union.
+    /// Keep host fd `fd` open past lockdown, with `access` on it ([`Config::fds`]). Granting one
+    /// fd twice grants the union.
     pub fn grant(&mut self, fd: RawFd, access: Access) -> &mut Self {
-        self.grants.push((fd, access));
-        self
-    }
-
-    /// What a refused call from the gate gets (default: kill).
-    pub fn deny(&mut self, deny: Deny) -> &mut Self {
-        self.deny = deny;
-        self
-    }
-
-    /// One more seccomp program, stacked under the filter: the kernel runs every filter and takes
-    /// the strictest answer, so a restriction can only take away (a call the mode allows fails as
-    /// the restriction says; one it refuses stays refused), never add. A classic-BPF program over
-    /// `struct seccomp_data`, as seccompiler and libseccomp make them. It sees the guest's calls
-    /// from the gate and the program's (which the filter traps: of the kernel's precedence,
-    /// KILL > TRAP > ERRNO > ALLOW, only a kill outranks a trap, so an ERRNO leaves the
-    /// program's call to the guest). Repeatable.
-    pub fn restrict(&mut self, prog: impl IntoIterator<Item = SockFilter>) -> &mut Self {
-        self.restrictions.push(prog.into_iter().collect());
+        self.fds.push((fd, access));
         self
     }
 }
@@ -245,7 +225,10 @@ impl Sandbox {
     /// 6. every capability dropped (bounding where permitted, ambient, effective, permitted,
     ///    inheritable);
     /// 7. `no_new_privs`;
-    /// 8. the caller's restrictions, then the filter, with TSYNC (redundant after step 1, kept).
+    /// 8. the filter ([`filter`]), with TSYNC (redundant after step 1, kept).
+    ///
+    /// A caller that wants more restrictions installs its own seccomp filter before this: filters
+    /// stack, the strictest answer wins (it must let lockdown's own calls through).
     ///
     /// On success the process is locked down and the caller hands over to the program. On failure
     /// nothing untrusted has run.

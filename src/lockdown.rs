@@ -8,7 +8,7 @@ use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use crate::filter::{self, Pins, SockFilter};
+use crate::filter::{self, SockFilter};
 use crate::{Access, Config, Confined, Error, Mode, Result};
 
 fn os(what: &'static str) -> impl FnOnce(io::Error) -> Error {
@@ -29,17 +29,16 @@ pub fn check_ns() -> u64 {
 }
 
 pub(crate) fn lockdown<C: Confined + ?Sized>(config: Config, guest: &C) -> Result<()> {
-    let mode = guest.mode();
+    let mode = config.mode;
     let guest_fds: Vec<RawFd> = guest.host_fds().to_vec();
-    // The filter's pins: the grants, and the guest's fds read and write. Compiled first: it
+    let grants = config.fds.clone();
+    // The filter's fds: the grants, and the guest's read and write. Compiled first: it
     // allocates, and checks nothing.
-    let mut fds = config.grants.clone();
-    fds.extend(guest_fds.iter().map(|&fd| (fd, Access::ReadWrite)));
+    let mut all = config;
+    all.fds.extend(guest_fds.iter().map(|&fd| (fd, Access::ReadWrite)));
     // SAFETY: getpid.
     let pid = unsafe { libc::getpid() } as u32;
-    let pins = Pins { pid, fds };
-    let prog = filter::filter(mode, config.deny, &pins, guest.gate_ip()).map_err(|e| Error::Filter(e.to_string()))?;
-    let restrictions: Vec<Vec<SockFilter>> = config.restrictions.iter().map(|r| filter::restriction(r)).collect();
+    let prog = filter::filter(&all, pid, guest.gate_ip()).map_err(|e| Error::Filter(e.to_string()))?;
 
     let t = Instant::now();
     // The checks read /proc/self: it must be the kernel's procfs, not whatever is mounted there
@@ -59,7 +58,7 @@ pub(crate) fn lockdown<C: Confined + ?Sized>(config: Config, guest: &C) -> Resul
             return Err(Error::FdKind { fd, kind });
         }
     }
-    for &(fd, _) in &config.grants {
+    for &(fd, _) in &grants {
         // SAFETY: fcntl on an fd number, which may not be open.
         if fd < 0 || unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
             return Err(Error::NotOpen(fd));
@@ -69,7 +68,7 @@ pub(crate) fn lockdown<C: Confined + ?Sized>(config: Config, guest: &C) -> Resul
     check_maps(mode)?;
     // 4. Every other fd closed, not refused (a CLI inherits stray fds): between and above the
     // kept ones.
-    let mut keep: Vec<RawFd> = pins.fds.iter().map(|&(fd, _)| fd).collect();
+    let mut keep: Vec<RawFd> = all.fds.iter().map(|&(fd, _)| fd).collect();
     keep.sort_unstable();
     keep.dedup();
     close_except(&keep)?;
@@ -91,11 +90,8 @@ pub(crate) fn lockdown<C: Confined + ?Sized>(config: Config, guest: &C) -> Resul
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return Err(last_os("PR_SET_NO_NEW_PRIVS"));
     }
-    // 8. The restrictions (each lets the next `seccomp` through), then the filter, with TSYNC.
-    for r in &restrictions {
-        install(r, false)?;
-    }
-    install(&prog, true)
+    // 8. The filter, with TSYNC.
+    install(&prog)
 }
 
 /// `/proc/self` is on procfs (`PROC_SUPER_MAGIC`).
@@ -180,7 +176,7 @@ fn check_maps(mode: Mode) -> Result<()> {
 
 /// One `/proc/self/maps` line (`lo-hi perms offset dev inode [path]`), judged as [`check_maps`]
 /// says.
-pub(crate) fn map_ok(line: &str, mode: Mode) -> bool {
+pub fn map_ok(line: &str, mode: Mode) -> bool {
     let mut f = line.splitn(6, ' ');
     let (Some(_range), Some(perms), Some(_off), Some(dev), Some(_inode)) = (f.next(), f.next(), f.next(), f.next(), f.next())
     else {
@@ -283,12 +279,12 @@ struct SockFprog {
     filter: *const SockFilter,
 }
 
-/// `insns` installed (`SECCOMP_SET_MODE_FILTER`), with TSYNC on every thread of the process when
-/// `all_threads` (a failure to sync is lockdown's failure).
-pub(crate) fn install(insns: &[SockFilter], all_threads: bool) -> Result<()> {
+/// `insns` installed (`SECCOMP_SET_MODE_FILTER`), with TSYNC on every thread of the process (a
+/// failure to sync is lockdown's failure).
+fn install(insns: &[SockFilter]) -> Result<()> {
     let len = u16::try_from(insns.len()).map_err(|_| Error::Filter(format!("{} instructions", insns.len())))?;
     let fprog = SockFprog { len, filter: insns.as_ptr() };
-    let flags = if all_threads { libc::SECCOMP_FILTER_FLAG_TSYNC } else { 0 };
+    let flags = libc::SECCOMP_FILTER_FLAG_TSYNC;
     // SAFETY: seccomp reads `fprog` and the instructions, both live for the call.
     let r = unsafe { libc::syscall(libc::SYS_seccomp, libc::SECCOMP_SET_MODE_FILTER, flags, &fprog as *const SockFprog) };
     if r < 0 {
@@ -299,34 +295,4 @@ pub(crate) fn install(insns: &[SockFilter], all_threads: bool) -> Result<()> {
         return Err(Error::Threads(vec![r as i32]));
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn maps_rules() {
-        let ok = |l: &str, m| map_ok(l, m);
-        let all = [Mode::Coroutine, Mode::Threaded, Mode::Fork];
-        for m in all {
-            assert!(ok("55d0-55d1 r-xp 00000000 fd:01 123                        /usr/bin/x", m));
-            assert!(ok("7f00-7f01 rw-p 00000000 00:00 0 ", m));
-            assert!(ok("7f00-7f01 rw-p 00000000 00:00 0", m));
-            assert!(ok("7ffd-7ffe rw-p 00000000 00:00 0                          [stack]", m));
-            assert!(ok("7f00-7f01 r--s 00000000 fd:01 99                         /nix/store/x.erofs", m));
-            assert!(!ok("7f00-7f01 rw-s 00000000 fd:01 99                        /tmp/file", m));
-            assert!(!ok("7f00-7f01 -w-s 00000000 fd:01 99                        /tmp/file", m));
-            assert!(!ok("7f00-7f01 rw-s 00000000 00:01 9                         /memfd:x (deleted)", m));
-            assert!(!ok("7f00-7f01 rw-s 00000000 00:01 9                         /SYSV00000000 (deleted)", m));
-            assert!(!ok("garbage", m));
-            assert!(!ok("", m));
-        }
-        let anon = "7f00-7f01 rw-s 00000000 00:01 146407                     /dev/zero (deleted)";
-        assert!(ok(anon, Mode::Fork));
-        assert!(!ok(anon, Mode::Coroutine));
-        assert!(!ok(anon, Mode::Threaded));
-        // A host file can't pass for it: not on the kernel's internal mount.
-        assert!(!ok("7f00-7f01 rw-s 00000000 fd:01 9                         /dev/zero (deleted)", Mode::Fork));
-    }
 }

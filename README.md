@@ -7,7 +7,7 @@ After `Sandbox::configure_and_lockdown()` returns, the current process can use t
   (a) its configured syscalls (see below for the default modes which pin arguments, including fds)
   (b) its memory mappings, none of which can write outside the sandbox (i.e., each is private, read-only, or (fork mode only) anonymous memory shared among the sandbox's own processes)
 
-Access is enforced by seccomp, with three configurations, one per mode ([`rules()`](src/filter.rs)):
+Access is enforced by seccomp, with three configurations, one per mode ([`table()`](src/filter.rs)):
 1. `coroutine`: every guest thread runs on one host thread
 2. `threaded`: a host thread per guest thread, taking turns on one guest CPU
 3. `fork`: as threaded, and a guest fork is a host fork; the processes share one guest kernel
@@ -27,7 +27,7 @@ Anything else kills the process.
 The complete TCB then includes:
 - seccomp being correctly implemented by your Linux kernel
 - `/proc/self/{task,fd,maps}` correctly pointing to the current process (part of the lockdown check)
-- the Rust toolchain, `libc` (constants, raw syscalls), and `seccompiler` (the allowlist's compiler: checked against an independent one in 2.3M cases, `src/filter/tests.rs`)
+- the Rust toolchain, `libc` (constants, raw syscalls), and `seccompiler` (the allowlist's compiler: checked against a plain model of the table above, `tests/filter.rs`)
 - hardware
 
 ## Not guaranteed
@@ -54,7 +54,7 @@ The filter is seccompiler's allowlist behind one hand-written check: a call not 
 ## Review checklist
 | Guarantee | Where | Verify |
 |---|---|---|
-| allowlist | `src/filter.rs` `rules()` | each entry pins every argument it needs; nothing creates an fd or a mapping |
+| allowlist | `src/filter.rs` `table()` | each row pins every argument it needs; nothing creates an fd or a mapping |
 | gate check | `src/filter.rs` `gate_check()` | returns only TRAP or KILL |
 | one thread | `src/lockdown.rs` | counted before any other check |
 | fds | `src/lockdown.rs` | the guest's kinds checked; everything else closed |

@@ -6,7 +6,7 @@
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
-use exobox_tcb::{Access, Confined, Deny, Error, Mode, Sandbox};
+use exobox_tcb::{Access, Config, Confined, Error, Mode, Sandbox};
 
 // ------------------------------------------------------------------------------------------------
 // A gate, and a SIGSYS handler that returns through it.
@@ -101,12 +101,21 @@ impl Confined for Guest {
     fn host_fds(&self) -> &[RawFd] {
         &self.fds
     }
-    fn mode(&self) -> Mode {
-        self.mode
-    }
     fn gate_ip(&self) -> u64 {
         gate_ip()
     }
+}
+
+/// Lockdown for `guest`, in its mode, with the grants `grants` makes.
+fn lockdown(guest: &Guest, grants: impl FnOnce(&mut Config)) -> exobox_tcb::Result<()> {
+    Sandbox::configure_and_lockdown(
+        |s| {
+            s.mode = guest.mode;
+            grants(s);
+            Ok(())
+        },
+        guest,
+    )
 }
 
 fn eventfd() -> RawFd {
@@ -138,9 +147,9 @@ fn exit_code(status: i32) -> i32 {
     libc::WEXITSTATUS(status)
 }
 
-/// Locked down (deny = errno): granted calls from the gate go through with the access granted,
-/// the rest are EPERM; a call not from the gate traps (SYS_SECCOMP); the fds neither granted nor
-/// the guest's are closed (ppoll, allowed from the gate, sees POLLNVAL).
+/// Locked down: granted calls from the gate go through with the access granted; a call not from
+/// the gate traps (SYS_SECCOMP); the fds neither granted nor the guest's are closed (ppoll,
+/// allowed from the gate, sees POLLNVAL). Refused calls are [`each_refused_call_kills`]'.
 #[test]
 fn locks_down_and_probes() {
     for mode in [Mode::Coroutine, Mode::Threaded, Mode::Fork] {
@@ -152,30 +161,20 @@ fn locks_down_and_probes() {
             let ro_fd = ro.as_raw_fd();
             install_handler();
             let guest = Guest { fds: vec![efd], mode };
-            let r = Sandbox::configure_and_lockdown(
-                |s| {
-                    s.grant(1, Access::Write).grant(2, Access::Write).grant(ro_fd, Access::Read).deny(Deny::Errno);
-                    Ok(())
-                },
-                &guest,
-            );
+            let r = lockdown(&guest, |s| {
+                s.grant(1, Access::Write).grant(2, Access::Write).grant(ro_fd, Access::Read);
+            });
             if r.is_err() {
                 return 1;
             }
-            let eperm = -libc::EPERM as isize;
             let buf = [0u8; 8];
             let one = 1u64.to_ne_bytes();
             let ptr = buf.as_ptr() as usize;
-            let checks: [(i64, [usize; 3], isize); 8] = [
+            let checks: [(i64, [usize; 3], isize); 4] = [
                 (libc::SYS_write, [1, ptr, 0], 0),
                 (libc::SYS_write, [efd as usize, one.as_ptr() as usize, 8], 8),
                 (libc::SYS_read, [efd as usize, ptr, 8], 8),
                 (libc::SYS_read, [ro_fd as usize, ptr, 0], 0),
-                // Read-only is read only; stdin wasn't granted.
-                (libc::SYS_write, [ro_fd as usize, ptr, 0], eperm),
-                (libc::SYS_read, [0, ptr, 0], eperm),
-                (libc::SYS_getppid, [0, 0, 0], eperm),
-                (libc::SYS_openat, [libc::AT_FDCWD as usize, c"/".as_ptr() as usize, 0], eperm),
             ];
             for (i, (nr, a, want)) in checks.into_iter().enumerate() {
                 if g(nr, a) != want {
@@ -206,18 +205,36 @@ fn locks_down_and_probes() {
     }
 }
 
-/// Deny = kill (the default): a refused gate call kills the process with SIGSYS.
+/// Each refused call from the gate kills the process with SIGSYS: a write on a read-only grant,
+/// a read of stdin (not granted), getppid, openat.
 #[test]
-fn refused_call_kills() {
-    let status = in_child(|| {
-        let guest = Guest { fds: vec![], mode: Mode::Coroutine };
-        if Sandbox::configure_and_lockdown(|_| Ok(()), &guest).is_err() {
-            return 1;
-        }
-        g(libc::SYS_getppid, [0; 3]);
-        2
-    });
-    assert!(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS, "status {status:#x}");
+fn each_refused_call_kills() {
+    type Probe = fn(RawFd) -> (i64, [usize; 3]);
+    let probes: [Probe; 4] = [
+        |ro| (libc::SYS_write, [ro as usize, 0, 0]),
+        |_| (libc::SYS_read, [0, 0, 0]),
+        |_| (libc::SYS_getppid, [0, 0, 0]),
+        |_| (libc::SYS_openat, [libc::AT_FDCWD as usize, c"/".as_ptr() as usize, 0]),
+    ];
+    for (i, probe) in probes.into_iter().enumerate() {
+        let status = in_child(|| {
+            let ro = std::fs::File::open("/proc/self/stat").unwrap();
+            let ro_fd = ro.as_raw_fd();
+            let guest = Guest { fds: vec![], mode: Mode::Coroutine };
+            if lockdown(&guest, |s| {
+                s.grant(ro_fd, Access::Read);
+            })
+            .is_err()
+            {
+                return 1;
+            }
+            let (nr, a) = probe(ro_fd);
+            g(nr, a);
+            std::mem::forget(ro);
+            2
+        });
+        assert!(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS, "probe {i}: status {status:#x}");
+    }
 }
 
 /// After lockdown the process is not dumpable and dumps no core: the parent sees its /proc files
@@ -321,7 +338,7 @@ fn refuses_a_writable_shared_file_mapping() {
             let got = exit_code(in_child(|| {
                 map(fd, prot, flags);
                 let guest = Guest { fds: vec![], mode };
-                verdict(Sandbox::configure_and_lockdown(|_| Ok(()), &guest))
+                verdict(lockdown(&guest, |_| ()))
             }));
             assert_eq!(got, want, "{mode:?} prot {prot} flags {flags:#x}");
         }
@@ -337,7 +354,7 @@ fn shared_anonymous_memory_in_fork_mode_only() {
     for (mode, want) in [(Mode::Coroutine, 1), (Mode::Threaded, 1), (Mode::Fork, 0)] {
         let got = exit_code(in_child(|| {
             map(-1, rw, libc::MAP_SHARED | libc::MAP_ANONYMOUS);
-            verdict(Sandbox::configure_and_lockdown(|_| Ok(()), &Guest { fds: vec![], mode }))
+            verdict(lockdown(&Guest { fds: vec![], mode }, |_| ()))
         }));
         assert_eq!(got, want, "{mode:?}");
         let got = exit_code(in_child(|| {
@@ -346,7 +363,7 @@ fn shared_anonymous_memory_in_fork_mode_only() {
             // SAFETY: sizes it.
             assert_eq!(unsafe { libc::ftruncate(fd, 4096) }, 0);
             map(fd, rw, libc::MAP_SHARED);
-            verdict(Sandbox::configure_and_lockdown(|_| Ok(()), &Guest { fds: vec![], mode }))
+            verdict(lockdown(&Guest { fds: vec![], mode }, |_| ()))
         }));
         assert_eq!(got, 1, "{mode:?} memfd");
     }
@@ -360,27 +377,27 @@ fn refuses_a_guest_fd_of_the_wrong_kind() {
         let (f, _) = temp_file();
         let fd = f.as_raw_fd();
         std::mem::forget(f);
-        verdict(Sandbox::configure_and_lockdown(|_| Ok(()), &Guest { fds: vec![eventfd(), fd], mode: Mode::Threaded }))
+        verdict(lockdown(&Guest { fds: vec![eventfd(), fd], mode: Mode::Threaded }, |_| ()))
     }));
     assert_eq!(got, 2);
     let got = exit_code(in_child(|| {
         let mut p = [0; 2];
         // SAFETY: a pipe.
         assert_eq!(unsafe { libc::pipe(p.as_mut_ptr()) }, 0);
-        verdict(Sandbox::configure_and_lockdown(|_| Ok(()), &Guest { fds: vec![p[1]], mode: Mode::Threaded }))
+        verdict(lockdown(&Guest { fds: vec![p[1]], mode: Mode::Threaded }, |_| ()))
     }));
     assert_eq!(got, 2);
     let got = exit_code(in_child(|| {
         // SAFETY: a pidfd of this process.
         let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) } as RawFd;
-        verdict(Sandbox::configure_and_lockdown(|_| Ok(()), &Guest { fds: vec![eventfd(), pidfd], mode: Mode::Fork }))
+        verdict(lockdown(&Guest { fds: vec![eventfd(), pidfd], mode: Mode::Fork }, |_| ()))
     }));
     assert_eq!(got, 0);
     // A pidfd outside fork mode: refused (only fork mode's processes poll init's).
     let got = exit_code(in_child(|| {
         // SAFETY: a pidfd of this process.
         let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) } as RawFd;
-        verdict(Sandbox::configure_and_lockdown(|_| Ok(()), &Guest { fds: vec![pidfd], mode: Mode::Threaded }))
+        verdict(lockdown(&Guest { fds: vec![pidfd], mode: Mode::Threaded }, |_| ()))
     }));
     assert_eq!(got, 2);
 }
@@ -394,13 +411,13 @@ fn refuses_a_second_thread() {
                 std::thread::park();
             }
         });
-        verdict(Sandbox::configure_and_lockdown(|_| Ok(()), &Guest { fds: vec![], mode: Mode::Coroutine }))
+        verdict(lockdown(&Guest { fds: vec![], mode: Mode::Coroutine }, |_| ()))
     }));
     assert_eq!(got, 3);
     // A thread joined just before is gone in time.
     let got = exit_code(in_child(|| {
         std::thread::spawn(|| ()).join().unwrap();
-        verdict(Sandbox::configure_and_lockdown(|_| Ok(()), &Guest { fds: vec![], mode: Mode::Coroutine }))
+        verdict(lockdown(&Guest { fds: vec![], mode: Mode::Coroutine }, |_| ()))
     }));
     assert_eq!(got, 0);
 }
