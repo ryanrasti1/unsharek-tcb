@@ -86,11 +86,9 @@ pub fn policy(mode: Mode, pid: u64, ppoll_max: u64, gate: u64) -> impl Fn(&secco
 
 // The proof: a harness per mode (one with the mode symbolic took 5x as long: 663 s against
 // 131 s), every other param symbolic.
-seccomp_fn_validate::policy!(policy, filter, unwind = 100, [
-    coroutine: (Mode::Coroutine, kani::any(), kani::any(), kani::any()),
-    threaded: (Mode::Threaded, kani::any(), kani::any(), kani::any()),
-    fork: (Mode::Fork, kani::any(), kani::any(), kani::any()),
-]);
+seccomp_fn_validate::policy!(policy, filter, unwind = 100, (
+    Mode = [coroutine: Coroutine, threaded: Threaded, fork: Fork], _, _, _
+));
 
 /// The filter for `mode` and `ppoll_max` ([`crate::Config`]'s): [`policy`]'s program. `pid` is
 /// the process's own (the one `kill` may signal), `gate` the gate's
