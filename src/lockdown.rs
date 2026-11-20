@@ -8,7 +8,10 @@ use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use seccomp_fn::{InstallError, SockFilter};
+use rustix::io::Errno;
+use rustix::process::{DumpableBehavior, Resource, Rlimit};
+use rustix::thread::{CapabilitySet, CapabilitySets};
+use seccomp_fn::SockFilter;
 
 use crate::filter;
 use crate::{Config, Confined, Error, Mode, Result};
@@ -19,6 +22,11 @@ fn os(what: &'static str) -> impl FnOnce(io::Error) -> Error {
 
 fn last_os(what: &'static str) -> Error {
     os(what)(io::Error::last_os_error())
+}
+
+/// rustix's error, as [`os`].
+fn rx(what: &'static str) -> impl FnOnce(Errno) -> Error {
+    move |e| Error::Os { what, source: e.into() }
 }
 
 /// How long the last lockdown's checks (steps 1-4: threads, fds, mappings, the close) took, in ns: for
@@ -38,8 +46,7 @@ pub(crate) fn lockdown<C: Confined + ?Sized>(config: Config, guest: &C) -> Resul
     // and checks nothing.
     let mut all = config;
     all.fds.extend(guest_fds.iter().copied());
-    // SAFETY: getpid.
-    let pid = unsafe { libc::getpid() } as u32;
+    let pid = rustix::process::getpid().as_raw_nonzero().get() as u32;
     let prog = filter::filter(&all, pid, guest.gate_ip());
 
     let t = Instant::now();
@@ -61,8 +68,8 @@ pub(crate) fn lockdown<C: Confined + ?Sized>(config: Config, guest: &C) -> Resul
         }
     }
     for &fd in &grants {
-        // SAFETY: fcntl on an fd number, which may not be open.
-        if fd < 0 || unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        // Open: /proc/self/fd has it, as for the guest's (no fd borrowed unsafely).
+        if fd < 0 || fd_kind(fd).is_err() {
             return Err(Error::NotOpen(fd));
         }
     }
@@ -76,36 +83,21 @@ pub(crate) fn lockdown<C: Confined + ?Sized>(config: Config, guest: &C) -> Resul
     close_except(&keep)?;
     CHECK_NS.store(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     // 5. No core dump, not dumpable.
-    let none = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-    // SAFETY: sets a limit of this process.
-    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &none) } != 0 {
-        return Err(last_os("RLIMIT_CORE"));
-    }
-    // SAFETY: sets a flag of this process.
-    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
-        return Err(last_os("PR_SET_DUMPABLE"));
-    }
+    rustix::process::setrlimit(Resource::Core, Rlimit { current: Some(0), maximum: Some(0) }).map_err(rx("RLIMIT_CORE"))?;
+    rustix::process::set_dumpable_behavior(DumpableBehavior::NotDumpable).map_err(rx("PR_SET_DUMPABLE"))?;
     // 6. Capabilities.
     drop_capabilities()?;
     // 7. no_new_privs: unprivileged seccomp needs it, and no exec gains anything after.
-    // SAFETY: sets a flag of this process.
-    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-        return Err(last_os("PR_SET_NO_NEW_PRIVS"));
-    }
+    rustix::thread::set_no_new_privs(true).map_err(rx("PR_SET_NO_NEW_PRIVS"))?;
     // 8. The filter, with TSYNC.
     install(&prog)
 }
 
 /// `/proc/self` is on procfs (`PROC_SUPER_MAGIC`).
 fn proc_is_procfs() -> Result<()> {
-    const PROC_SUPER_MAGIC: libc::c_long = 0x9fa0;
-    // SAFETY: statfs into a local.
-    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
-    // SAFETY: a NUL-terminated path; the kernel writes `st`.
-    if unsafe { libc::statfs(c"/proc/self".as_ptr(), &mut st) } != 0 {
-        return Err(last_os("/proc/self"));
-    }
-    if st.f_type != PROC_SUPER_MAGIC {
+    const PROC_SUPER_MAGIC: i64 = 0x9fa0;
+    let st = rustix::fs::statfs("/proc/self").map_err(rx("/proc/self"))?;
+    if st.f_type as i64 != PROC_SUPER_MAGIC {
         return Err(Error::Os { what: "/proc", source: io::Error::other(format!("not procfs (f_type {:#x})", st.f_type)) });
     }
     Ok(())
@@ -114,8 +106,7 @@ fn proc_is_procfs() -> Result<()> {
 /// Step 1. A thread just joined (exobox's image builders) is still listed while it finishes
 /// exiting: a few milliseconds' grace, then the others are named.
 fn one_thread() -> Result<()> {
-    // SAFETY: gettid.
-    let me = unsafe { libc::gettid() };
+    let me = rustix::thread::gettid().as_raw_nonzero().get();
     let mut others = vec![];
     for _ in 0..20 {
         others = std::fs::read_dir("/proc/self/task")
@@ -197,30 +188,19 @@ pub fn map_ok(line: &str, mode: Mode) -> bool {
     }
 }
 
-/// `struct __user_cap_header_struct` and `__user_cap_data_struct` (linux/capability.h).
-#[repr(C)]
-struct CapHeader {
-    version: u32,
-    pid: i32,
+/// The process's capability sets (`capget`).
+fn capget() -> Result<CapabilitySets> {
+    rustix::thread::capabilities(None).map_err(rx("capget"))
 }
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct CapData {
-    effective: u32,
-    permitted: u32,
-    inheritable: u32,
-}
-const CAP_VERSION_3: u32 = 0x2008_0522;
-const CAP_SETPCAP: u32 = 8;
 
-fn capget() -> Result<[CapData; 2]> {
-    let mut h = CapHeader { version: CAP_VERSION_3, pid: 0 };
-    let mut d = [CapData::default(); 2];
-    // SAFETY: the kernel writes two data structs (version 3).
-    if unsafe { libc::syscall(libc::SYS_capget, &mut h, d.as_mut_ptr()) } != 0 {
-        return Err(last_os("capget"));
-    }
-    Ok(d)
+/// Capability number `n`, as rustix takes one.
+fn cap(n: u32) -> CapabilitySet {
+    CapabilitySet::from_bits_retain(1 << n)
+}
+
+/// Any capability in any of the three sets.
+fn any(d: &CapabilitySets) -> bool {
+    !(d.effective | d.permitted | d.inheritable).is_empty()
 }
 
 /// Step 6. The bounding set is dropped where the process may (it holds `CAP_SETPCAP`); an
@@ -228,47 +208,35 @@ fn capget() -> Result<[CapData; 2]> {
 /// through the filter, the bounding set bounds nothing it could gain. Then ambient, effective,
 /// permitted and inheritable cleared, and checked empty: lockdown fails if any isn't.
 fn drop_capabilities() -> Result<()> {
+    use rustix::thread::{capability_is_in_ambient_set, capability_is_in_bounding_set};
     let d = capget()?;
-    let has_setpcap = d[0].effective & (1 << CAP_SETPCAP) != 0;
-    if has_setpcap {
-        for cap in 0..64 {
-            // SAFETY: reads the bounding set; EINVAL past the last capability.
-            let r = unsafe { libc::prctl(libc::PR_CAPBSET_READ, cap, 0, 0, 0) };
-            if r < 0 {
-                break;
-            }
-            // SAFETY: drops one capability from the bounding set.
-            if r == 1 && unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) } != 0 {
-                return Err(last_os("PR_CAPBSET_DROP"));
+    if d.effective.contains(CapabilitySet::SETPCAP) {
+        for n in 0..64 {
+            // Reads the bounding set; EINVAL past the last capability.
+            let Ok(set) = capability_is_in_bounding_set(cap(n)) else { break };
+            if set {
+                rustix::thread::remove_capability_from_bounding_set(cap(n)).map_err(rx("PR_CAPBSET_DROP"))?;
             }
         }
     }
-    // SAFETY: clears the ambient set (EINVAL on kernels without it: none to clear).
-    if unsafe { libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) } != 0
-        && io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL)
-    {
-        return Err(last_os("PR_CAP_AMBIENT_CLEAR_ALL"));
+    // Clears the ambient set (EINVAL on kernels without it: none to clear).
+    match rustix::thread::clear_ambient_capability_set() {
+        Err(e) if e != Errno::INVAL => return Err(rx("PR_CAP_AMBIENT_CLEAR_ALL")(e)),
+        _ => {}
     }
-    if d.iter().any(|c| c.effective | c.permitted | c.inheritable != 0) {
-        let mut h = CapHeader { version: CAP_VERSION_3, pid: 0 };
-        let none = [CapData::default(); 2];
-        // SAFETY: the kernel reads two data structs; lowering every set is always permitted.
-        if unsafe { libc::syscall(libc::SYS_capset, &mut h, none.as_ptr()) } != 0 {
-            return Err(last_os("capset"));
-        }
+    if any(&d) {
+        // Lowering every set is always permitted.
+        let none = CapabilitySets { effective: CapabilitySet::empty(), permitted: CapabilitySet::empty(), inheritable: CapabilitySet::empty() };
+        rustix::thread::set_capabilities(None, none).map_err(rx("capset"))?;
     }
-    let d = capget()?;
-    if d.iter().any(|c| c.effective | c.permitted | c.inheritable != 0) {
+    if any(&capget()?) {
         return Err(Error::Capabilities("some remain after capset".into()));
     }
-    for cap in 0..64 {
-        // SAFETY: reads the ambient set.
-        let r = unsafe { libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_IS_SET, cap, 0, 0) };
-        if r < 0 {
-            break;
-        }
-        if r == 1 {
-            return Err(Error::Capabilities(format!("ambient capability {cap} remains")));
+    for n in 0..64 {
+        // Reads the ambient set; EINVAL past the last capability.
+        let Ok(set) = capability_is_in_ambient_set(cap(n)) else { break };
+        if set {
+            return Err(Error::Capabilities(format!("ambient capability {n} remains")));
         }
     }
     Ok(())
@@ -277,9 +245,19 @@ fn drop_capabilities() -> Result<()> {
 /// `insns` installed (`SECCOMP_SET_MODE_FILTER`), with TSYNC on every thread of the process (a
 /// failure to sync is lockdown's failure).
 fn install(insns: &[SockFilter]) -> Result<()> {
-    seccomp_fn::install(insns, true).map_err(|e| match e {
-        InstallError::TooLong(n) => Error::Filter(format!("{n} instructions")),
-        InstallError::Os(source) => Error::Os { what: "seccomp", source },
-        InstallError::Thread(tid) => Error::Threads(vec![tid]),
-    })
+    let len = u16::try_from(insns.len()).map_err(|_| Error::Filter(format!("{} instructions", insns.len())))?;
+    // the kernel only reads the instructions
+    let fprog = libc::sock_fprog { len, filter: insns.as_ptr() as *mut SockFilter };
+    // SAFETY: seccomp reads `fprog` and the instructions, both live for the call.
+    let r = unsafe {
+        libc::syscall(libc::SYS_seccomp, libc::SECCOMP_SET_MODE_FILTER, libc::SECCOMP_FILTER_FLAG_TSYNC, &fprog as *const libc::sock_fprog)
+    };
+    if r < 0 {
+        return Err(Error::Os { what: "seccomp", source: std::io::Error::last_os_error() });
+    }
+    // With TSYNC, a positive result is the id of a thread that couldn't be synced.
+    if r != 0 {
+        return Err(Error::Threads(vec![r as i32]));
+    }
+    Ok(())
 }

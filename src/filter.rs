@@ -21,8 +21,6 @@ use crate::{Config, Mode};
 // The policy's constants, libc's.
 use libc::{SYS_clone, SYS_exit, SYS_exit_group, SYS_kill, SYS_ppoll, SYS_read, SYS_rt_sigreturn, SYS_write};
 pub use libc::{SECCOMP_RET_ALLOW, SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_TRAP};
-const SIGCHLD: u64 = libc::SIGCHLD as u64;
-const CLONE_PARENT: u64 = libc::CLONE_PARENT as u64;
 // Not in libc for x86_64:
 /// include/uapi/linux/audit.h: `AUDIT_ARCH_X86_64 = EM_X86_64 | __AUDIT_ARCH_64BIT |
 /// __AUDIT_ARCH_LE` (the last two `0x80000000` and `0x40000000`), EM_X86_64 libc's.
@@ -71,7 +69,7 @@ pub fn policy(d: &SeccompData, mode: Mode, pid: u64, ppoll_max: u64, gate: u64) 
         SYS_exit if threads && d.args[0] == 0 => SECCOMP_RET_ALLOW,
         // A host fork: exactly SIGCHLD (CLONE_PARENT too, from a forked process: every process
         // a child of init's), no new stack.
-        SYS_clone if fork && (d.args[0] == SIGCHLD || d.args[0] == CLONE_PARENT | SIGCHLD) && d.args[1] == 0 => {
+        SYS_clone if fork && (d.args[0] == libc::SIGCHLD as u64 || d.args[0] == (libc::CLONE_PARENT | libc::SIGCHLD) as u64) && d.args[1] == 0 => {
             SECCOMP_RET_ALLOW
         }
         // Nothing else: no memory call (the arena is reserved before), nothing that makes an fd.
