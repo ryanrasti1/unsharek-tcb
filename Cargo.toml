@@ -1,0 +1,21 @@
+[package]
+name = "unsharek-tcb"
+version = "0.0.0"
+description = "Lockdown for an in-process sandbox: checks the process's threads, fds and mappings, drops what it may not keep, and installs one seccomp filter"
+# Its own repository-to-be: nothing here is inherited from a workspace.
+edition = "2024"
+rust-version = "1.88"
+license = "GPL-2.0-only"
+
+[dependencies]
+# The filter, a Rust function compiled to classic BPF and proven equal to it (src/filter.rs)
+seccomp-fn = { path = "../../seccomp-fn/seccomp-fn" }
+# Lockdown's syscalls and constants
+libc = "0.2"
+# Typed wrappers for lockdown's syscalls but close_range and seccomp (raw syscalls, no libc)
+rustix = { version = "1", default-features = false, features = ["std", "thread", "process", "fs"] }
+
+[dev-dependencies]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
