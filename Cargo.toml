@@ -15,7 +15,7 @@ seccomp-fn-verify = { path = "../../seccomp-fn/seccomp-fn-verify" }
 # Lockdown's syscalls and constants
 libc = "0.2"
 # Typed wrappers for lockdown's syscalls but close_range and seccomp (raw syscalls, no libc)
-rustix = { version = "1", default-features = false, features = ["std", "thread", "process", "fs"] }
+rustix = { version = "1", default-features = false, features = ["std", "thread", "process", "fs", "net"] }
 
 [dev-dependencies]
 

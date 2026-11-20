@@ -46,8 +46,10 @@ pub(crate) fn lockdown<C: Confined + ?Sized>(config: Config, guest: &C) -> Resul
     // and checks nothing.
     let mut all = config;
     all.fds.extend(guest_fds.iter().copied());
+    all.fds.extend(all.recv_fds);
+    let ctl = all.recv_fds.map_or(filter::NO_CTL, |fd| fd as u64);
     let pid = rustix::process::getpid().as_raw_nonzero().get() as u32;
-    let prog = filter::filter(all.mode, pid as u64, all.ppoll_max, guest.gate_ip());
+    let prog = filter::filter(all.mode, pid as u64, all.ppoll_max, guest.gate_ip(), ctl);
 
     let t = Instant::now();
     // The checks read /proc/self: it must be the kernel's procfs, not whatever is mounted there
@@ -73,6 +75,11 @@ pub(crate) fn lockdown<C: Confined + ?Sized>(config: Config, guest: &C) -> Resul
             return Err(Error::NotOpen(fd));
         }
     }
+    // Plugin: capnweb. The control socket is a unix seqpacket socket: `recvmsg` on it brings in
+    // only what its peer (the provider's process) sends, in whole messages.
+    if let Some(fd) = all.recv_fds {
+        control_socket(fd)?;
+    }
     // 3. Every mapping.
     check_maps(mode)?;
     // 4. Every other fd closed, not refused (a CLI inherits stray fds): between and above the
@@ -91,6 +98,20 @@ pub(crate) fn lockdown<C: Confined + ?Sized>(config: Config, guest: &C) -> Resul
     rustix::thread::set_no_new_privs(true).map_err(rx("PR_SET_NO_NEW_PRIVS"))?;
     // 8. The filter, with TSYNC.
     install(&prog)
+}
+
+/// The control socket ([`Config::recv_fds`]): open, `AF_UNIX`, `SOCK_SEQPACKET`.
+fn control_socket(fd: RawFd) -> Result<()> {
+    if fd < 0 || fd_kind(fd).is_err() {
+        return Err(Error::NotOpen(fd));
+    }
+    // SAFETY: `fd` is open (above), borrowed for the two getsockopts only.
+    let s = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+    let (domain, kind) = (rustix::net::sockopt::socket_domain(s), rustix::net::sockopt::socket_type(s));
+    match (domain, kind) {
+        (Ok(rustix::net::AddressFamily::UNIX), Ok(rustix::net::SocketType::SEQPACKET)) => Ok(()),
+        _ => Err(Error::FdKind { fd, kind: fd_kind(fd).unwrap_or_default() }),
+    }
 }
 
 /// `/proc/self` is on procfs (`PROC_SUPER_MAGIC`).

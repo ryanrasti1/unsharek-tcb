@@ -3,7 +3,7 @@
 //! in seconds: the same assertion sampled (seccomp-fn-verify's `check_sampled`), for each mode
 //! and some params; README.md's table against the policy's rows.
 
-use unsharek_tcb::{AUDIT_ARCH_X86_64, Mode, PPOLL_FDS, RET_ALLOW, filter, policy, seccomp_data, sock_filter};
+use unsharek_tcb::{AUDIT_ARCH_X86_64, Mode, NO_CTL, PPOLL_FDS, RET_ALLOW, filter, policy, seccomp_data, sock_filter};
 
 const GATE: u64 = 0x0000_7f12_3456_7890;
 const PID: u32 = 4242;
@@ -22,7 +22,8 @@ const PPOLL: u32 = libc::SYS_ppoll as u32;
 fn filter_is_the_policy() {
     for mode in MODES {
         for (pid, ppoll_max, gate) in [(PID, PPOLL_FDS, GATE), (1, 0, 0), (u32::MAX, 3, u64::MAX), (7, u64::MAX, 1 << 32)] {
-            seccomp_fn_verify::check_sampled(policy, filter, (mode, pid as u64, ppoll_max, gate), 5_000);
+            seccomp_fn_verify::check_sampled(policy, filter, (mode, pid as u64, ppoll_max, gate, NO_CTL), 5_000);
+            seccomp_fn_verify::check_sampled(policy, filter, (mode, pid as u64, ppoll_max, gate, 7), 5_000);
         }
     }
 }
@@ -30,14 +31,14 @@ fn filter_is_the_policy() {
 /// The numbers [`policy`] allows in `mode`, for some arguments: every x86-64 number, each tried
 /// with the arguments the program compares with (its jumps' constants: all fit 32 bits).
 fn ruled(mode: Mode) -> std::collections::BTreeSet<u32> {
-    let prog = filter(mode, PID as u64, PPOLL_FDS, GATE);
+    let prog = filter(mode, PID as u64, PPOLL_FDS, GATE, NO_CTL);
     let k: Vec<u64> = prog.iter().filter(|i| i.code & 0x07 == 0x05).map(|i| i.k as u64).chain([0, 1]).collect();
     let mut out = std::collections::BTreeSet::new();
     for nr in 0..1024u32 {
         for &a0 in &k {
             for &a1 in &k {
                 let d = seccomp_data { nr: nr as i32, arch: AUDIT_ARCH_X86_64, instruction_pointer: GATE, args: [a0, a1, 0, 0, 0, 0] };
-                if policy(mode, PID as u64, PPOLL_FDS, GATE)(&d) == RET_ALLOW {
+                if policy(mode, PID as u64, PPOLL_FDS, GATE, NO_CTL)(&d) == RET_ALLOW {
                     out.insert(nr as u32);
                 }
             }
@@ -53,7 +54,7 @@ fn program_rows(mode: Mode) -> Vec<Vec<u32>> {
     let ld_nr = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
     let jeq = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
     let off_nr = std::mem::offset_of!(libc::seccomp_data, nr) as u32;
-    let prog: Vec<sock_filter> = filter(mode, PID as u64, PPOLL_FDS, GATE);
+    let prog: Vec<sock_filter> = filter(mode, PID as u64, PPOLL_FDS, GATE, NO_CTL);
     let mut out: Vec<Vec<u32>> = vec![];
     let mut in_row = false;
     for i in &prog {
@@ -125,8 +126,34 @@ fn readme_table_is_the_policy() {
 #[test]
 fn filter_length() {
     for mode in MODES {
-        let n = filter(mode, PID as u64, PPOLL_FDS, GATE).len();
+        let n = filter(mode, PID as u64, PPOLL_FDS, GATE, NO_CTL).len();
         eprintln!("{mode:?}: {n} instructions");
         assert!(n <= 128, "{mode:?}: {n} instructions");
+    }
+}
+
+/// Plugin: capnweb. `recvmsg` is allowed exactly on the control socket with `MSG_CMSG_CLOEXEC`,
+/// and only when there is one; `sendmsg` never.
+#[test]
+fn recvmsg_only_on_the_control_socket() {
+    let recvmsg = libc::SYS_recvmsg as i32;
+    let sendmsg = libc::SYS_sendmsg as i32;
+    let cloexec = libc::MSG_CMSG_CLOEXEC as u64;
+    let call = |nr: i32, fd: u64, flags: u64| seccomp_data {
+        nr,
+        arch: AUDIT_ARCH_X86_64,
+        instruction_pointer: GATE,
+        args: [fd, 0x1000, flags, 0, 0, 0],
+    };
+    for mode in MODES {
+        let with = |d: &seccomp_data| policy(mode, PID as u64, PPOLL_FDS, GATE, 7)(d);
+        let without = |d: &seccomp_data| policy(mode, PID as u64, PPOLL_FDS, GATE, NO_CTL)(d);
+        assert_eq!(with(&call(recvmsg, 7, cloexec)), RET_ALLOW, "{mode:?}");
+        assert_ne!(with(&call(recvmsg, 8, cloexec)), RET_ALLOW, "{mode:?}: another fd");
+        assert_ne!(with(&call(recvmsg, 7, 0)), RET_ALLOW, "{mode:?}: without MSG_CMSG_CLOEXEC");
+        assert_ne!(with(&call(recvmsg, 7, cloexec | libc::MSG_DONTWAIT as u64)), RET_ALLOW, "{mode:?}: more flags");
+        assert_ne!(with(&call(sendmsg, 7, 0)), RET_ALLOW, "{mode:?}: sendmsg");
+        assert_ne!(without(&call(recvmsg, 7, cloexec)), RET_ALLOW, "{mode:?}: no control socket");
+        assert_ne!(without(&call(recvmsg, NO_CTL, cloexec)), RET_ALLOW, "{mode:?}: the sentinel itself");
     }
 }
