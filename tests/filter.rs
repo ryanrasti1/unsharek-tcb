@@ -23,7 +23,7 @@ fn filter_is_the_policy() {
     for mode in MODES {
         for (pid, ppoll_max, gate) in [(PID, PPOLL_FDS, GATE), (1, 0, 0), (u32::MAX, 3, u64::MAX), (7, u64::MAX, 1 << 32)] {
             seccomp_fn_verify::check_sampled(policy, filter, (mode, pid as u64, ppoll_max, gate, None), 5_000);
-            seccomp_fn_verify::check_sampled(policy, filter, (mode, pid as u64, ppoll_max, gate, Some(7)), 5_000);
+            seccomp_fn_verify::check_sampled(policy, filter, (mode, pid as u64, ppoll_max, gate, Some((7, 9))), 5_000);
         }
     }
 }
@@ -146,7 +146,7 @@ fn recvmsg_only_on_the_control_socket() {
         args: [fd, 0x1000, flags, 0, 0, 0],
     };
     for mode in MODES {
-        let with = |d: &seccomp_data| policy(mode, PID as u64, PPOLL_FDS, GATE, Some(7))(d);
+        let with = |d: &seccomp_data| policy(mode, PID as u64, PPOLL_FDS, GATE, Some((7, 9)))(d);
         let without = |d: &seccomp_data| policy(mode, PID as u64, PPOLL_FDS, GATE, None)(d);
         assert_eq!(with(&call(recvmsg, 7, cloexec)), RET_ALLOW, "{mode:?}");
         assert_ne!(with(&call(recvmsg, 8, cloexec)), RET_ALLOW, "{mode:?}: another fd");
@@ -155,5 +155,21 @@ fn recvmsg_only_on_the_control_socket() {
         assert_ne!(with(&call(sendmsg, 7, 0)), RET_ALLOW, "{mode:?}: sendmsg");
         assert_ne!(without(&call(recvmsg, 7, cloexec)), RET_ALLOW, "{mode:?}: no control socket");
         assert_ne!(without(&call(recvmsg, 0, cloexec)), RET_ALLOW, "{mode:?}: the sentinel itself");
+    }
+}
+
+/// Plugin: capnweb. `close` only at or above the floor, as an int, only with a control socket.
+#[test]
+fn close_only_above_the_floor() {
+    let close = |fd: u64| seccomp_data { nr: libc::SYS_close as i32, arch: AUDIT_ARCH_X86_64, instruction_pointer: GATE, args: [fd, 0, 0, 0, 0, 0] };
+    for mode in MODES {
+        let with = |d: &seccomp_data| policy(mode, PID as u64, PPOLL_FDS, GATE, Some((7, 9)))(d);
+        let without = |d: &seccomp_data| policy(mode, PID as u64, PPOLL_FDS, GATE, None)(d);
+        assert_eq!(with(&close(9)), RET_ALLOW, "{mode:?}");
+        assert_eq!(with(&close(1000)), RET_ALLOW, "{mode:?}");
+        for fd in [0, 1, 2, 7, 8, 1 << 31, (1 << 32) | 1, u64::MAX] {
+            assert_ne!(with(&close(fd)), RET_ALLOW, "{mode:?}: close({fd:#x})");
+        }
+        assert_ne!(without(&close(1000)), RET_ALLOW, "{mode:?}: no control socket");
     }
 }

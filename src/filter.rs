@@ -21,7 +21,7 @@ use libc::{seccomp_data, sock_filter};
 use crate::Mode;
 
 // The policy's syscalls, libc's.
-use libc::{SYS_clone, SYS_exit, SYS_exit_group, SYS_kill, SYS_ppoll, SYS_read, SYS_recvmsg, SYS_rt_sigreturn, SYS_write};
+use libc::{SYS_clone, SYS_close, SYS_exit, SYS_exit_group, SYS_kill, SYS_ppoll, SYS_read, SYS_recvmsg, SYS_rt_sigreturn, SYS_write};
 pub use libc::{SECCOMP_RET_ALLOW, SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_TRAP};
 // Not in libc for x86_64:
 /// include/uapi/linux/audit.h: `AUDIT_ARCH_X86_64 = EM_X86_64 | __AUDIT_ARCH_64BIT |
@@ -44,11 +44,11 @@ pub const PPOLL_FDS: u64 = 8;
 
 /// The filter's verdict on a call `d`: README.md's table, a row per row, in its order. Each row
 /// widens what a compromised program can do through the gate, so each says why.
-pub fn policy(mode: Mode, pid: u64, ppoll_max: u64, gate: u64, ctl: Option<u64>) -> impl Fn(&seccomp_data) -> u32 {
+pub fn policy(mode: Mode, pid: u64, ppoll_max: u64, gate: u64, ctl: Option<(u64, u64)>) -> impl Fn(&seccomp_data) -> u32 {
     move |d| {
         // Plugin: capnweb. Its rows only with a control socket.
         let plugin = ctl.is_some();
-        let ctl_fd = ctl.unwrap_or(0);
+        let (ctl_fd, floor) = (ctl.map_or(0, |c| c.0), ctl.map_or(0, |c| c.1));
         // Another ABI: the rows know only x86-64's numbers, and must not judge another's.
         if d.arch != AUDIT_ARCH_X86_64 || d.nr as u32 >= X32_SYSCALL_BIT {
             return SECCOMP_RET_KILL_PROCESS;
@@ -87,6 +87,10 @@ pub fn policy(mode: Mode, pid: u64, ppoll_max: u64, gate: u64, ctl: Option<u64>)
             SYS_recvmsg if plugin && d.args[0] == ctl_fd && d.args[2] == libc::MSG_CMSG_CLOEXEC as u64 => {
                 SECCOMP_RET_ALLOW
             }
+            // Plugin: capnweb. The close of a received fd: every fd at or above `floor`, which
+            // lockdown fixed above every kept fd and below which it left none free, so only
+            // `recvmsg` makes one there. An int (the kernel reads 32 bits): no higher bits set.
+            SYS_close if plugin && d.args[0] >= floor && d.args[0] <= 0x7fff_ffff => SECCOMP_RET_ALLOW,
             // Nothing else: no memory call (the arena is reserved before), nothing that makes an fd.
             _ => SECCOMP_RET_KILL_PROCESS,
         }
@@ -97,13 +101,13 @@ pub fn policy(mode: Mode, pid: u64, ppoll_max: u64, gate: u64, ctl: Option<u64>)
 // 131 s), every other param symbolic.
 seccomp_fn_verify::policy!(policy, filter, unwind = 100, (
     Mode = [coroutine: Coroutine, threaded: Threaded, fork: Fork], _, _, _,
-    Option<u64> = [none: None, some: Some(_)]
+    Option<(u64, u64)> = [none: None, some: Some(_)]
 ));
 
 /// The filter for `mode` and `ppoll_max` ([`crate::Config`]'s): [`policy`]'s program. `pid` is
 /// the process's own (the one `kill` may signal), `gate` the gate's
-/// ([`crate::Confined::gate_ip`]), `ctl` the control socket's, if any. Public, so the
+/// ([`crate::Confined::gate_ip`]), `ctl` the control socket's, if any, and the floor of closable fds. Public, so the
 /// exact program can be inspected and tested.
-pub fn filter(mode: Mode, pid: u64, ppoll_max: u64, gate: u64, ctl: Option<u64>) -> Vec<sock_filter> {
+pub fn filter(mode: Mode, pid: u64, ppoll_max: u64, gate: u64, ctl: Option<(u64, u64)>) -> Vec<sock_filter> {
     seccomp_fn::compile!(policy(mode, pid, ppoll_max, gate, ctl))
 }

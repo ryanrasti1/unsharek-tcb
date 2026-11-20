@@ -227,3 +227,60 @@ fn refuses_a_control_socket_of_the_wrong_kind() {
         assert_eq!(code, 0, "{kind}");
     }
 }
+
+/// A received fd lands at or above the floor and may be closed; stdio, the control socket and a
+/// guest fd may not (SIGSYS); without a control socket there's no `close` at all.
+#[test]
+fn close_received_only() {
+    // 0: a received fd closed, then a second received (its number free again: reused)
+    let code = exit_code(in_child(|| {
+        let [ctl, provider] = socketpair(libc::SOCK_SEQPACKET);
+        let mut pipe = [0; 2];
+        // SAFETY: pipe into a local.
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        // A hole below the kept fds: lockdown must fill it, not leave it to recvmsg.
+        // SAFETY: closing our own fd.
+        unsafe { libc::close(pipe[0]) };
+        send_fd(provider, pipe[1]);
+        send_fd(provider, pipe[1]);
+        let guest = Guest { fds: vec![eventfd()], mode: Mode::Coroutine };
+        if lockdown(&guest, |s| s.recv_fds = Some(ctl)).is_err() {
+            return 1;
+        }
+        let a = gate_recv_fd(ctl, libc::MSG_CMSG_CLOEXEC);
+        if a <= ctl as isize {
+            return 2;
+        }
+        if g(libc::SYS_close, [a as usize, 0, 0]) != 0 {
+            return 3;
+        }
+        let b = gate_recv_fd(ctl, libc::MSG_CMSG_CLOEXEC);
+        if b != a {
+            return 4;
+        }
+        0
+    }));
+    assert_eq!(code, 0);
+    for (name, which) in [("stdout", 0), ("the control socket", 1), ("a guest fd", 2), ("no plugin", 3)] {
+        let status = in_child(|| {
+            let [ctl, _p] = socketpair(libc::SOCK_SEQPACKET);
+            let efd = eventfd();
+            let guest = Guest { fds: vec![efd], mode: Mode::Coroutine };
+            let r = lockdown(&guest, |s| {
+                s.grant(1);
+                if which != 3 {
+                    s.recv_fds = Some(ctl);
+                } else {
+                    s.grant(ctl);
+                }
+            });
+            if r.is_err() {
+                return 1;
+            }
+            let fd = [1, ctl, efd, ctl][which];
+            g(libc::SYS_close, [fd as usize, 0, 0]);
+            2
+        });
+        assert!(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS, "{name}: status {status:#x}");
+    }
+}
