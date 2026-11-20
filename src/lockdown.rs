@@ -8,10 +8,10 @@ use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use libc::sock_filter as SockFilter;
 use rustix::io::Errno;
 use rustix::process::{DumpableBehavior, Resource, Rlimit};
 use rustix::thread::{CapabilitySet, CapabilitySets};
-use seccomp_fn::SockFilter;
 
 use crate::filter;
 use crate::{Config, Confined, Error, Mode, Result};
@@ -47,7 +47,7 @@ pub(crate) fn lockdown<C: Confined + ?Sized>(config: Config, guest: &C) -> Resul
     let mut all = config;
     all.fds.extend(guest_fds.iter().copied());
     let pid = rustix::process::getpid().as_raw_nonzero().get() as u32;
-    let prog = filter::filter(&all, pid, guest.gate_ip());
+    let prog = filter::filter(all.mode, pid as u64, all.ppoll_max, guest.gate_ip());
 
     let t = Instant::now();
     // The checks read /proc/self: it must be the kernel's procfs, not whatever is mounted there
