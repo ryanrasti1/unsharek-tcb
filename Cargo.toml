@@ -8,8 +8,10 @@ rust-version = "1.88"
 license = "GPL-2.0-only"
 
 [dependencies]
-# The filter, a Rust function compiled to classic BPF and proven equal to it (src/filter.rs)
+# The filter, a Rust function compiled to classic BPF (seccomp-fn: not trusted) and proven
+# equal to it (seccomp-fn-validate: the proof) (src/filter.rs)
 seccomp-fn = { path = "../seccomp-fn/seccomp-fn" }
+seccomp-fn-validate = { path = "../seccomp-fn/seccomp-fn-validate" }
 # Lockdown's syscalls and constants
 libc = "0.2"
 

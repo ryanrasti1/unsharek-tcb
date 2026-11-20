@@ -70,7 +70,7 @@ pub use filter::{
     AUDIT_ARCH_X86_64, CLONE_THREAD_FLAGS, PPOLL_FDS, SECCOMP_RET_ALLOW as RET_ALLOW, SECCOMP_RET_KILL_PROCESS as RET_KILL_PROCESS,
     SECCOMP_RET_TRAP as RET_TRAP, X32_SYSCALL_BIT, filter, policy,
 };
-pub use seccomp_fn::{SeccompData, SockFilter};
+pub use libc::{seccomp_data, sock_filter};
 #[doc(hidden)]
 pub use lockdown::{check_ns, map_ok};
 
@@ -88,13 +88,6 @@ pub enum Mode {
     /// (`MAP_SHARED | MAP_ANONYMOUS`, made before lockdown), which lockdown accepts in this mode
     /// only.
     Fork,
-}
-
-/// Every mode, for the filter's sampled test (`policy_matches_its_bpf_sampled`).
-impl seccomp_fn::Sample for Mode {
-    fn samples() -> Vec<Self> {
-        vec![Mode::Coroutine, Mode::Threaded, Mode::Fork]
-    }
 }
 
 /// The guest whose program runs after lockdown: what lockdown asks of it. Nothing it says is

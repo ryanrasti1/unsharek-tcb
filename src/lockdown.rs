@@ -8,7 +8,7 @@ use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use seccomp_fn::{InstallError, SockFilter};
+use libc::sock_filter as SockFilter;
 
 use crate::filter;
 use crate::{Config, Confined, Error, Mode, Result};
@@ -40,7 +40,7 @@ pub(crate) fn lockdown<C: Confined + ?Sized>(config: Config, guest: &C) -> Resul
     all.fds.extend(guest_fds.iter().copied());
     // SAFETY: getpid.
     let pid = unsafe { libc::getpid() } as u32;
-    let prog = filter::filter(&all, pid, guest.gate_ip());
+    let prog = filter::filter(all.mode, pid as u64, all.ppoll_max, guest.gate_ip());
 
     let t = Instant::now();
     // The checks read /proc/self: it must be the kernel's procfs, not whatever is mounted there
@@ -277,9 +277,19 @@ fn drop_capabilities() -> Result<()> {
 /// `insns` installed (`SECCOMP_SET_MODE_FILTER`), with TSYNC on every thread of the process (a
 /// failure to sync is lockdown's failure).
 fn install(insns: &[SockFilter]) -> Result<()> {
-    seccomp_fn::install(insns, true).map_err(|e| match e {
-        InstallError::TooLong(n) => Error::Filter(format!("{n} instructions")),
-        InstallError::Os(source) => Error::Os { what: "seccomp", source },
-        InstallError::Thread(tid) => Error::Threads(vec![tid]),
-    })
+    let len = u16::try_from(insns.len()).map_err(|_| Error::Filter(format!("{} instructions", insns.len())))?;
+    // the kernel only reads the instructions
+    let fprog = libc::sock_fprog { len, filter: insns.as_ptr() as *mut SockFilter };
+    // SAFETY: seccomp reads `fprog` and the instructions, both live for the call.
+    let r = unsafe {
+        libc::syscall(libc::SYS_seccomp, libc::SECCOMP_SET_MODE_FILTER, libc::SECCOMP_FILTER_FLAG_TSYNC, &fprog as *const libc::sock_fprog)
+    };
+    if r < 0 {
+        return Err(Error::Os { what: "seccomp", source: std::io::Error::last_os_error() });
+    }
+    // With TSYNC, a positive result is the id of a thread that couldn't be synced.
+    if r != 0 {
+        return Err(Error::Threads(vec![r as i32]));
+    }
+    Ok(())
 }
