@@ -1,5 +1,5 @@
 //! The filter is its policy: [`policy`] is the filter, as a Rust function, and Kani proves
-//! [`filter`]'s program gives its verdict on every call (`cargo kani`, `./test --prove`). Here,
+//! [`filter`]'s program gives its verdict on every call (`cargo kani`, `cargo xtask prove`). Here,
 //! in seconds: the same assertion sampled (seccomp-fn-verify's `check_sampled`), for each mode
 //! and some params; README.md's table against the policy's rows.
 
