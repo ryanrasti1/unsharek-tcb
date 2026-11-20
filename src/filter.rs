@@ -99,7 +99,7 @@ pub fn policy(mode: Mode, pid: u64, ppoll_max: u64, gate: u64, ctl: Option<(u64,
 
 // The proof: a harness per mode (one with the mode symbolic took 5x as long: 663 s against
 // 131 s), every other param symbolic.
-seccomp_fn_verify::policy!(policy, filter, unwind = 100, (
+seccomp_fn_verify::policy!(policy, filter, unwind = 128, (
     Mode = [coroutine: Coroutine, threaded: Threaded, fork: Fork], _, _, _,
     Option<(u64, u64)> = [none: None, some: Some(_)]
 ));
