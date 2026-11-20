@@ -3,7 +3,8 @@
 //! in seconds: the macro's sampled test (`policy_matches_its_bpf_sampled`, the lib's), and here
 //! the same through [`filter`], for each mode; README.md's table against the policy's rows.
 
-use exobox_tcb::{AUDIT_ARCH_X86_64, Config, Mode, PPOLL_FDS, RET_ALLOW, SeccompData, SockFilter, filter, policy, policy_constants};
+use exobox_tcb::{AUDIT_ARCH_X86_64, Config, Mode, PPOLL_FDS, RET_ALLOW, SeccompData, SockFilter, filter, policy};
+use seccomp_fn::Seccomp;
 use seccomp_fn::{Field, check_sampled};
 
 const GATE: u64 = 0x0000_7f12_3456_7890;
@@ -25,8 +26,8 @@ fn filter_is_the_policy() {
         for (pid, ppoll_max, gate) in [(PID, PPOLL_FDS, GATE), (1, 0, 0), (u32::MAX, 3, u64::MAX), (7, u64::MAX, 1 << 32)] {
             let c = Config { mode, fds: vec![], ppoll_max };
             let prog = filter(&c, pid, gate);
-            let constants = policy_constants(mode, pid as u64, ppoll_max, gate);
-            check_sampled(&prog, &constants, 5_000, |d| policy(d, mode, pid as u64, ppoll_max, gate));
+            let constants = policy().constants((mode, pid as u64, ppoll_max, gate));
+            check_sampled(&prog, &constants, 5_000, |d| policy().run(d, (mode, pid as u64, ppoll_max, gate)));
         }
     }
 }
@@ -34,14 +35,14 @@ fn filter_is_the_policy() {
 /// The numbers [`policy`] allows in `mode`, for some arguments: its numbers, each tried with
 /// the arguments it compares with.
 fn ruled(mode: Mode) -> std::collections::BTreeSet<u32> {
-    let k = policy_constants(mode, PID as u64, PPOLL_FDS, GATE);
+    let k = policy().constants((mode, PID as u64, PPOLL_FDS, GATE));
     let of = |f: Field| -> Vec<u64> { k.iter().filter(|c| c.0 == f).map(|c| c.1).chain([0, 1]).collect() };
     let mut out = std::collections::BTreeSet::new();
     for nr in of(Field::Nr) {
         for &a0 in &of(Field::Arg(0)) {
             for &a1 in &of(Field::Arg(1)) {
                 let d = SeccompData { nr: nr as u32, arch: AUDIT_ARCH_X86_64, instruction_pointer: GATE, args: [a0, a1, 0, 0, 0, 0] };
-                if policy(&d, mode, PID as u64, PPOLL_FDS, GATE) == RET_ALLOW {
+                if policy().run(&d, (mode, PID as u64, PPOLL_FDS, GATE)) == RET_ALLOW {
                     out.insert(nr as u32);
                 }
             }

@@ -14,7 +14,7 @@
 //! There is one filter; no `prctl`, `seccomp` or syscall-user-dispatch rule is in it.
 #![allow(non_upper_case_globals)] // libc's syscall names, as patterns
 
-use seccomp_fn::{SeccompData, SockFilter, seccomp};
+use seccomp_fn::{Seccomp, SeccompData, SockFilter, seccomp_expr};
 
 use crate::{Config, Mode};
 
@@ -44,8 +44,11 @@ pub const PPOLL_FDS: u64 = 8;
 
 /// The filter's verdict on a call `d`: README.md's table, a row per row, in its order. Each row
 /// widens what a compromised program can do through the gate, so each says why.
-#[seccomp]
-pub fn policy(d: &SeccompData, mode: Mode, pid: u64, ppoll_max: u64, gate: u64) -> u32 {
+///
+/// Its params: `(mode, pid, ppoll_max, gate)`. `policy().run(d, params)` is the function,
+/// `policy().bpf(params)` its program; the proofs are items nested in this function.
+pub fn policy() -> impl Seccomp<(Mode, u64, u64, u64)> {
+    seccomp_expr!(|d: &SeccompData, mode: Mode, pid: u64, ppoll_max: u64, gate: u64| -> u32 {
     // Another ABI: the rows know only x86-64's numbers, and must not judge another's.
     if d.arch != AUDIT_ARCH_X86_64 || d.nr >= X32_SYSCALL_BIT {
         return SECCOMP_RET_KILL_PROCESS;
@@ -77,11 +80,20 @@ pub fn policy(d: &SeccompData, mode: Mode, pid: u64, ppoll_max: u64, gate: u64) 
         // Nothing else: no memory call (the arena is reserved before), nothing that makes an fd.
         _ => SECCOMP_RET_KILL_PROCESS,
     }
+    })
 }
 
 /// The filter for `config` (its mode and `ppoll_max`): [`policy`]'s program. `pid` is the
 /// process's own (the one `kill` may signal), `gate_ip` the gate's
 /// ([`crate::Confined::gate_ip`]). Public, so the exact program can be inspected and tested.
 pub fn filter(config: &Config, pid: u32, gate_ip: u64) -> Vec<SockFilter> {
-    policy_bpf(config.mode, pid as u64, config.ppoll_max, gate_ip)
+    policy().bpf((config.mode, pid as u64, config.ppoll_max, gate_ip))
+}
+
+/// The proof's assertion, sampled, in seconds (a `#[test]` the macro can't emit: nested in an
+/// expression, libtest wouldn't run it).
+#[cfg(test)]
+#[test]
+fn policy_matches_its_bpf_sampled() {
+    policy().check_sampled();
 }

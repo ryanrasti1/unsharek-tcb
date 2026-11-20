@@ -68,7 +68,7 @@ mod lockdown;
 
 pub use filter::{
     AUDIT_ARCH_X86_64, CLONE_THREAD_FLAGS, PPOLL_FDS, SECCOMP_RET_ALLOW as RET_ALLOW, SECCOMP_RET_KILL_PROCESS as RET_KILL_PROCESS,
-    SECCOMP_RET_TRAP as RET_TRAP, X32_SYSCALL_BIT, filter, policy, policy_bpf, policy_constants,
+    SECCOMP_RET_TRAP as RET_TRAP, X32_SYSCALL_BIT, filter, policy,
 };
 pub use seccomp_fn::{SeccompData, SockFilter};
 #[doc(hidden)]
