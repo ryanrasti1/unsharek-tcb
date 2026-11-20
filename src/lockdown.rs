@@ -47,7 +47,7 @@ pub(crate) fn lockdown<C: Confined + ?Sized>(config: Config, guest: &C) -> Resul
     let mut all = config;
     all.fds.extend(guest_fds.iter().copied());
     all.fds.extend(all.recv_fds);
-    let ctl = all.recv_fds.map_or(filter::NO_CTL, |fd| fd as u64);
+    let ctl = all.recv_fds.map(|fd| fd as u64);
     let pid = rustix::process::getpid().as_raw_nonzero().get() as u32;
     let prog = filter::filter(all.mode, pid as u64, all.ppoll_max, guest.gate_ip(), ctl);
 

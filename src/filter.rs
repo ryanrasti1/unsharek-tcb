@@ -41,14 +41,14 @@ pub const CLONE_THREAD_FLAGS: u64 = (libc::CLONE_VM
     | libc::CLONE_CHILD_CLEARTID) as u64;
 /// [`crate::Config::ppoll_max`]'s default.
 pub const PPOLL_FDS: u64 = 8;
-/// `ctl` when there is no control socket ([`crate::Config::recv_fds`] `None`): no fd has this
-/// number, and the `recvmsg` row checks for it too.
-pub const NO_CTL: u64 = u64::MAX;
 
 /// The filter's verdict on a call `d`: README.md's table, a row per row, in its order. Each row
 /// widens what a compromised program can do through the gate, so each says why.
-pub fn policy(mode: Mode, pid: u64, ppoll_max: u64, gate: u64, ctl: u64) -> impl Fn(&seccomp_data) -> u32 {
+pub fn policy(mode: Mode, pid: u64, ppoll_max: u64, gate: u64, ctl: Option<u64>) -> impl Fn(&seccomp_data) -> u32 {
     move |d| {
+        // Plugin: capnweb. Its rows only with a control socket.
+        let plugin = ctl.is_some();
+        let ctl_fd = ctl.unwrap_or(0);
         // Another ABI: the rows know only x86-64's numbers, and must not judge another's.
         if d.arch != AUDIT_ARCH_X86_64 || d.nr as u32 >= X32_SYSCALL_BIT {
             return SECCOMP_RET_KILL_PROCESS;
@@ -84,7 +84,7 @@ pub fn policy(mode: Mode, pid: u64, ppoll_max: u64, gate: u64, ctl: u64) -> impl
             // Plugin: capnweb (experimental). Fds from the provider's process, on the control
             // socket only (`ctl`, a unix seqpacket socket, lockdown checks), close-on-exec; none
             // sent out (no `sendmsg`). A received fd gets what every kept fd gets: `read`, `write`.
-            SYS_recvmsg if ctl != NO_CTL && d.args[0] == ctl && d.args[2] == libc::MSG_CMSG_CLOEXEC as u64 => {
+            SYS_recvmsg if plugin && d.args[0] == ctl_fd && d.args[2] == libc::MSG_CMSG_CLOEXEC as u64 => {
                 SECCOMP_RET_ALLOW
             }
             // Nothing else: no memory call (the arena is reserved before), nothing that makes an fd.
@@ -96,13 +96,14 @@ pub fn policy(mode: Mode, pid: u64, ppoll_max: u64, gate: u64, ctl: u64) -> impl
 // The proof: a harness per mode (one with the mode symbolic took 5x as long: 663 s against
 // 131 s), every other param symbolic.
 seccomp_fn_verify::policy!(policy, filter, unwind = 100, (
-    Mode = [coroutine: Coroutine, threaded: Threaded, fork: Fork], _, _, _, _
+    Mode = [coroutine: Coroutine, threaded: Threaded, fork: Fork], _, _, _,
+    Option<u64> = [none: None, some: Some(_)]
 ));
 
 /// The filter for `mode` and `ppoll_max` ([`crate::Config`]'s): [`policy`]'s program. `pid` is
 /// the process's own (the one `kill` may signal), `gate` the gate's
-/// ([`crate::Confined::gate_ip`]), `ctl` the control socket's ([`NO_CTL`]: none). Public, so the
+/// ([`crate::Confined::gate_ip`]), `ctl` the control socket's, if any. Public, so the
 /// exact program can be inspected and tested.
-pub fn filter(mode: Mode, pid: u64, ppoll_max: u64, gate: u64, ctl: u64) -> Vec<sock_filter> {
+pub fn filter(mode: Mode, pid: u64, ppoll_max: u64, gate: u64, ctl: Option<u64>) -> Vec<sock_filter> {
     seccomp_fn::compile!(policy(mode, pid, ppoll_max, gate, ctl))
 }
