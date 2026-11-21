@@ -694,3 +694,127 @@ fn check_times() {
         assert_eq!(code, 0);
     }
 }
+
+// ------------------------------------------------------------------------------------------------
+// Plugins: fs (Landlock-confined roots) and net.
+
+/// A read-only root: a file in it opens (by absolute path, any dirfd >= n) and reads; one
+/// outside it is EACCES (Landlock; a write open is no row: the next test). Read-write: a file made
+/// and written under the root, and still EACCES outside it.
+#[test]
+fn fs_roots_are_confined() {
+    let base = std::env::temp_dir().join(format!("unsharek-tcb-fs-{}", std::process::id()));
+    let (root, out) = (base.join("root"), base.join("out"));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(root.join("in"), b"in").unwrap();
+    std::fs::write(out.join("x"), b"x").unwrap();
+    let c = |p: &std::path::Path| std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+    let (inside, outside, new) = (c(&root.join("in")), c(&out.join("x")), c(&root.join("new")));
+    let nb = (libc::O_NONBLOCK | libc::O_CLOEXEC) as usize;
+    for access in [unsharek_tcb::Fs::ReadOnly, unsharek_tcb::Fs::ReadWrite] {
+        let code = exit_code(in_child(|| {
+            let Ok(f) = lockdown(&Guest { fds: vec![], mode: Mode::Coroutine }, |s| *s = s.clone().fs_root(&root, access)) else {
+                return 1;
+            };
+            let n = f.n as usize;
+            let fd = g(libc::SYS_openat, [n, inside.as_ptr() as usize, nb]);
+            let mut b = [0u8; 2];
+            if fd < n as isize || g(libc::SYS_read, [fd as usize, b.as_mut_ptr() as usize, 2]) != 2 || &b != b"in" {
+                return 2;
+            }
+            if g(libc::SYS_openat, [n, outside.as_ptr() as usize, nb]) != -(libc::EACCES as isize) {
+                return 3;
+            }
+            if access == unsharek_tcb::Fs::ReadWrite {
+                // SAFETY: openat from the gate, with a mode.
+                let w = unsafe { gate(libc::SYS_openat as usize, n, new.as_ptr() as usize, nb | (libc::O_CREAT | libc::O_WRONLY) as usize, 0o644, 0, 0) };
+                if w < n as isize || g(libc::SYS_write, [w as usize, b.as_ptr() as usize, 2]) != 2 {
+                    return 4;
+                }
+                // SAFETY: as above.
+                let o = unsafe { gate(libc::SYS_openat as usize, n, outside.as_ptr() as usize, nb | libc::O_WRONLY as usize, 0, 0, 0) };
+                if o != -(libc::EACCES as isize) {
+                    return 5;
+                }
+                return 0;
+            }
+            0
+        }));
+        assert_eq!(code, 0, "{access:?}");
+        if access == unsharek_tcb::Fs::ReadWrite {
+            assert_eq!(std::fs::read(root.join("new")).unwrap(), b"in");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A read-only lockdown's write open: the filter kills it.
+#[test]
+fn fs_read_only_refuses_a_write_open() {
+    let status = in_child(|| {
+        let Ok(f) = lockdown(&Guest { fds: vec![], mode: Mode::Coroutine }, |s| *s = s.clone().fs_root("/", unsharek_tcb::Fs::ReadOnly)) else {
+            return 1;
+        };
+        g(libc::SYS_openat, [f.n as usize, c"/tmp/x".as_ptr() as usize, (libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) as usize]);
+        2
+    });
+    assert!(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS, "status {status:#x}");
+}
+
+/// Net: a TCP listener and a connection to it on loopback, all through the gate, after lockdown.
+#[test]
+fn net_sockets_work() {
+    let code = exit_code(in_child(|| {
+        let Ok(_) = lockdown(&Guest { fds: vec![], mode: Mode::Coroutine }, |s| *s = s.clone().net(true)) else {
+            return 1;
+        };
+        let st = (libc::SOCK_STREAM | libc::SOCK_CLOEXEC) as usize;
+        let l = g(libc::SYS_socket, [libc::AF_INET as usize, st, 0]);
+        let mut a: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        a.sin_family = libc::AF_INET as u16;
+        a.sin_addr.s_addr = u32::from_be_bytes([127, 0, 0, 1]).to_be();
+        let len = std::mem::size_of::<libc::sockaddr_in>();
+        if l < 0 || g(libc::SYS_bind, [l as usize, &a as *const _ as usize, len]) != 0 || g(libc::SYS_listen, [l as usize, 1, 0]) != 0 {
+            return 2;
+        }
+        let mut alen = len as u32;
+        if g(libc::SYS_getsockname, [l as usize, &mut a as *mut _ as usize, &mut alen as *mut _ as usize]) != 0 {
+            return 3;
+        }
+        let c = g(libc::SYS_socket, [libc::AF_INET as usize, st, 0]);
+        if g(libc::SYS_connect, [c as usize, &a as *const _ as usize, len]) != 0 {
+            return 4;
+        }
+        // SAFETY: accept4 from the gate.
+        let s = unsafe { gate(libc::SYS_accept4 as usize, l as usize, 0, 0, libc::SOCK_CLOEXEC as usize, 0, 0) };
+        let msg = *b"hi";
+        // SAFETY: sendto/recvfrom from the gate.
+        let sent = unsafe { gate(libc::SYS_sendto as usize, c as usize, msg.as_ptr() as usize, 2, libc::MSG_NOSIGNAL as usize, 0, 0) };
+        let mut b = [0u8; 2];
+        // SAFETY: as above.
+        let got = unsafe { gate(libc::SYS_recvfrom as usize, s as usize, b.as_mut_ptr() as usize, 2, 0, 0, 0) };
+        if s < 0 || sent != 2 || got != 2 || b != msg {
+            return 5;
+        }
+        if g(libc::SYS_close, [s as usize, 0, 0]) != 0 {
+            return 6;
+        }
+        0
+    }));
+    assert_eq!(code, 0);
+}
+
+/// The opt-out: with `no_landlock` the fs rows go in without a ruleset (a file outside the root
+/// opens: the roots confine nothing).
+#[test]
+fn fs_without_landlock() {
+    let code = exit_code(in_child(|| {
+        let Ok(f) = lockdown(&Guest { fds: vec![], mode: Mode::Coroutine }, |s| *s = s.clone().fs_root("/nonexistent-root", unsharek_tcb::Fs::ReadOnly).no_landlock(true)) else {
+            return 1;
+        };
+        let fd = g(libc::SYS_openat, [f.n as usize, c"/proc/version".as_ptr() as usize, (libc::O_NONBLOCK | libc::O_CLOEXEC) as usize]);
+        if fd < f.n as isize { 2 } else { 0 }
+    }));
+    assert_eq!(code, 0);
+}

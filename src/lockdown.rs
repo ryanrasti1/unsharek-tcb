@@ -15,7 +15,7 @@ use rustix::process::{DumpableBehavior, Resource, Rlimit};
 use rustix::thread::{CapabilitySet, CapabilitySets};
 
 use crate::filter;
-use crate::{Config, Error, Fds, Mode, Result};
+use crate::{Config, Error, Fds, Fs, Mode, Result};
 
 fn os(what: &'static str) -> impl FnOnce(io::Error) -> Error {
     move |source| Error::Os { what, source }
@@ -52,15 +52,15 @@ pub(crate) fn lockdown(config: Config) -> Result<Fds> {
     let gate = config.gate.ok_or(Error::NoGate)?;
     let guest_fds: Vec<RawFd> = config.guest_fds.clone();
     let grants = config.fds.clone();
-    // The kept fds: the grants, the guest's and the control socket, and their new numbers. The
-    // filter is compiled first (it allocates, and checks nothing), for the floor `n` and the
-    // control socket's new number.
-    let mut keep: Vec<RawFd> = grants.iter().chain(&guest_fds).chain(&config.recv_fds).copied().collect();
+    // The kept fds: the grants and the guest's, and their new numbers. The filter is compiled
+    // first (it allocates, and checks nothing), for the floor `n`.
+    let mut keep: Vec<RawFd> = grants.iter().chain(&guest_fds).copied().collect();
     keep.sort_unstable();
     keep.dedup();
     let fds = renumbered(&keep);
-    let ctl = config.recv_fds.map(|fd| fds.get(fd).unwrap_or(-1) as u64);
-    let prog = filter::filter(mode, fds.n as u64, config.ppoll_max, gate, ctl);
+    let prog = filter::filter(mode, fds.n as u64, config.ppoll_max, gate, config.fs(), config.net);
+    // Plugin: fs. Landlock is there (refused now, before anything changes, if not).
+    let landlock = if config.fs_roots.is_empty() || config.no_landlock { None } else { Some(landlock_abi(config.fs())?) };
 
     {
         // Every read of /proc is through this one fd, checked to be the kernel's procfs (not
@@ -96,11 +96,6 @@ pub(crate) fn lockdown(config: Config) -> Result<Fds> {
                 return Err(Error::NotOpen(fd));
             }
         }
-        // Plugin: capnweb. The control socket is a unix seqpacket socket: `recvmsg` on it brings
-        // in only what its peer (the provider's process) sends, in whole messages.
-        if let Some(fd) = config.recv_fds {
-            control_socket(&proc, fd)?;
-        }
         // 3. Every mapping.
         check_maps(&proc, mode)?;
         CHECK_NS.store(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -116,6 +111,10 @@ pub(crate) fn lockdown(config: Config) -> Result<Fds> {
     drop_capabilities()?;
     // 7. no_new_privs: unprivileged seccomp needs it, and no exec gains anything after.
     rustix::thread::set_no_new_privs(true).map_err(rx("PR_SET_NO_NEW_PRIVS"))?;
+    // 7b. Plugin: fs. The roots' Landlock ruleset (it needs no_new_privs).
+    if let Some(abi) = landlock {
+        restrict_to_roots(abi, &config.fs_roots)?;
+    }
     // 8. The filter, with TSYNC.
     install(&prog)?;
     Ok(fds)
@@ -163,18 +162,123 @@ fn compact(fds: &Fds) -> Result<()> {
     Ok(())
 }
 
-/// The control socket ([`Config::recv_fds`]): open, `AF_UNIX`, `SOCK_SEQPACKET`.
-fn control_socket(proc: &OwnedFd, fd: RawFd) -> Result<()> {
-    if fd < 0 || fd_kind(proc, fd).is_err() {
-        return Err(Error::NotOpen(fd));
+// Landlock's (include/uapi/linux/landlock.h; not in libc): the calls, and the fs rights.
+const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
+const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
+const EXECUTE: u64 = 1 << 0;
+const WRITE_FILE: u64 = 1 << 1;
+const READ_FILE: u64 = 1 << 2;
+const READ_DIR: u64 = 1 << 3;
+const REMOVE_DIR: u64 = 1 << 4;
+const REMOVE_FILE: u64 = 1 << 5;
+const MAKE_CHAR: u64 = 1 << 6;
+const MAKE_DIR: u64 = 1 << 7;
+const MAKE_REG: u64 = 1 << 8;
+const MAKE_SOCK: u64 = 1 << 9;
+const MAKE_FIFO: u64 = 1 << 10;
+const MAKE_BLOCK: u64 = 1 << 11;
+const MAKE_SYM: u64 = 1 << 12;
+/// ABI 2.
+const REFER: u64 = 1 << 13;
+/// ABI 3.
+const TRUNCATE: u64 = 1 << 14;
+/// ABI 5.
+const IOCTL_DEV: u64 = 1 << 15;
+
+/// The kernel's Landlock ABI version, if it has the rights `access` needs (read-write: `REFER`,
+/// ABI 2, and `TRUNCATE`, ABI 3); an error if not, or if it has none: disabled, or hidden by a
+/// seccomp profile (Docker's older ones answer ENOSYS or EPERM). `IOCTL_DEV` (ABI 5) is used
+/// where there.
+fn landlock_abi(access: Fs) -> Result<u32> {
+    const OPT_OUT: &str = "where file access is already scoped (a container's own filesystem) set \
+                           Config::no_landlock, or map the files into the guest instead (unsharek's `map`)";
+    // SAFETY: the version query reads nothing.
+    let v = unsafe { libc::syscall(libc::SYS_landlock_create_ruleset, std::ptr::null::<u8>(), 0usize, LANDLOCK_CREATE_RULESET_VERSION) };
+    if v < 1 {
+        return Err(Error::Landlock(format!("unavailable ({}): the fs plugin's roots need it; {OPT_OUT}", io::Error::last_os_error())));
     }
-    // SAFETY: `fd` is open (above), borrowed for the two getsockopts only.
-    let s = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
-    let (domain, kind) = (rustix::net::sockopt::socket_domain(s), rustix::net::sockopt::socket_type(s));
-    match (domain, kind) {
-        (Ok(rustix::net::AddressFamily::UNIX), Ok(rustix::net::SocketType::SEQPACKET)) => Ok(()),
-        _ => Err(Error::FdKind { fd, kind: fd_kind(proc, fd).unwrap_or_default() }),
+    let need = if access == Fs::ReadWrite { 3 } else { 1 };
+    if v < need {
+        return Err(Error::Landlock(format!(
+            "ABI {v}: read-write roots need ABI 3 (REFER for a rename between directories, TRUNCATE); {OPT_OUT}"
+        )));
     }
+    Ok(v as u32)
+}
+
+/// Every fs right the kernel's Landlock (`abi`) knows: all handled, so each is denied but where
+/// a root's rule allows it.
+fn handled(abi: u32) -> u64 {
+    let mut r = EXECUTE | WRITE_FILE | READ_FILE | READ_DIR | REMOVE_DIR | REMOVE_FILE | MAKE_CHAR | MAKE_DIR | MAKE_REG | MAKE_SOCK | MAKE_FIFO | MAKE_BLOCK | MAKE_SYM;
+    if abi >= 2 {
+        r |= REFER;
+    }
+    if abi >= 3 {
+        r |= TRUNCATE;
+    }
+    if abi >= 5 {
+        r |= IOCTL_DEV;
+    }
+    r
+}
+
+/// A root's rights: read-only, reading files and directories (not executing: no exec reaches the
+/// host); read-write, also writing, truncating, making and removing regular files, directories
+/// and symlinks, and renaming (`REFER`). Never a device, FIFO or socket node, nor a device's
+/// ioctl.
+fn rights(abi: u32, access: Fs) -> u64 {
+    let ro = READ_FILE | READ_DIR;
+    let rw = ro | WRITE_FILE | REMOVE_DIR | REMOVE_FILE | MAKE_DIR | MAKE_REG | MAKE_SYM | REFER | TRUNCATE;
+    let r = match access {
+        Fs::Off => 0,
+        Fs::ReadOnly => ro,
+        Fs::ReadWrite => rw,
+    };
+    r & handled(abi)
+}
+
+/// Step 7b: a ruleset handling every right, a rule per root (opened `O_PATH` here, closed before
+/// the filter), enforced on this thread (the only one).
+fn restrict_to_roots(abi: u32, roots: &[(std::path::PathBuf, Fs)]) -> Result<()> {
+    #[repr(C)]
+    struct RulesetAttr {
+        handled_access_fs: u64,
+    }
+    #[repr(C, packed)]
+    struct PathBeneath {
+        allowed_access: u64,
+        parent_fd: i32,
+    }
+    let attr = RulesetAttr { handled_access_fs: handled(abi) };
+    // SAFETY: the kernel reads `attr` (its first field: the size given).
+    let rs = unsafe { libc::syscall(libc::SYS_landlock_create_ruleset, &attr as *const RulesetAttr, std::mem::size_of::<RulesetAttr>(), 0u32) };
+    if rs < 0 {
+        return Err(Error::Landlock(format!("create_ruleset: {}", io::Error::last_os_error())));
+    }
+    // SAFETY: the ruleset fd, just made, ours.
+    let rs = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(rs as RawFd) };
+    for (root, access) in roots {
+        let dir = rustix::fs::open(root, OFlags::PATH | OFlags::CLOEXEC, FsMode::empty())
+            .map_err(|e| Error::Landlock(format!("root {}: {e}", root.display())))?;
+        let mut allowed = rights(abi, *access);
+        // A file as a root: only a file's rights (Landlock refuses a directory's on it).
+        if rustix::fs::fstat(&dir).is_ok_and(|st| rustix::fs::FileType::from_raw_mode(st.st_mode) != rustix::fs::FileType::Directory) {
+            allowed &= EXECUTE | WRITE_FILE | READ_FILE | TRUNCATE | IOCTL_DEV;
+        }
+        let rule = PathBeneath { allowed_access: allowed, parent_fd: std::os::fd::AsRawFd::as_raw_fd(&dir) };
+        // SAFETY: the kernel reads `rule`; both fds are open.
+        let r = unsafe {
+            libc::syscall(libc::SYS_landlock_add_rule, std::os::fd::AsRawFd::as_raw_fd(&rs), LANDLOCK_RULE_PATH_BENEATH, &rule as *const PathBeneath, 0u32)
+        };
+        if r != 0 {
+            return Err(Error::Landlock(format!("root {}: {}", root.display(), io::Error::last_os_error())));
+        }
+    }
+    // SAFETY: restricts this thread (the process's only one) by the ruleset.
+    if unsafe { libc::syscall(libc::SYS_landlock_restrict_self, std::os::fd::AsRawFd::as_raw_fd(&rs), 0u32) } != 0 {
+        return Err(Error::Landlock(format!("restrict_self: {}", io::Error::last_os_error())));
+    }
+    Ok(())
 }
 
 /// `/proc/self`, opened once: a directory on procfs (`PROC_SUPER_MAGIC`).

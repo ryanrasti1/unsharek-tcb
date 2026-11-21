@@ -27,8 +27,29 @@ Plugins (experimental) widen the table only when the caller enables them, and on
 
 | Syscall | Allowed when | Modes |
 |---|---|---|
-| `recvmsg` | plugin: network. Only on the control socket (`Config::recv_fds`, a unix seqpacket socket lockdown checks), only with `MSG_CMSG_CLOEXEC`; received fds get `read`/`write` like every kept fd | plugin |
-| `close` | plugin: network. Only fds at or above a floor one above every kept fd (lockdown fills the numbers below it), and below 2^31: received connections, never a kept fd | plugin |
+| `close` | fd ≥ n (one a plugin opened) | fs, net |
+| `openat` | dirfd ≥ n; always `O_NONBLOCK \| O_CLOEXEC`; `O_RDONLY` with `O_DIRECTORY`, `O_NOFOLLOW`; read-write also `O_WRONLY`/`O_RDWR` with `O_TRUNC`, `O_APPEND`, `O_CREAT` (`O_EXCL`); mode without `S_ISUID`/`S_ISGID`; never `O_PATH`, `O_TMPFILE`, `O_DIRECT` | fs |
+| `lseek` | fd ≥ n, whence up to `SEEK_HOLE` | fs |
+| `fstat`, `getdents64`, `fstatfs`, `pread64` | fd ≥ n | fs |
+| `newfstatat` | dirfd ≥ n, flags 0 or `AT_SYMLINK_NOFOLLOW` | fs |
+| `statx` | dirfd ≥ n, flags 0 or `AT_SYMLINK_NOFOLLOW` | fs |
+| `readlinkat` | dirfd ≥ n | fs |
+| `fcntl` | fd ≥ n; `F_GETFL`, or `F_SETFL` to 0 or `O_NONBLOCK` (read-write: with `O_APPEND`) | fs |
+| `mkdirat`, `fchmodat` | dirfd ≥ n, mode without `S_ISUID`/`S_ISGID` | fs-rw |
+| `unlinkat` | dirfd ≥ n, flags 0 or `AT_REMOVEDIR` | fs-rw |
+| `renameat2` | both dirfds ≥ n, flags 0, `RENAME_NOREPLACE` or `RENAME_EXCHANGE` | fs-rw |
+| `linkat` | both dirfds ≥ n, flags 0 or `AT_SYMLINK_FOLLOW` | fs-rw |
+| `symlinkat` | dirfd ≥ n | fs-rw |
+| `fchownat` | dirfd ≥ n, flags 0 or `AT_SYMLINK_NOFOLLOW` | fs-rw |
+| `utimensat` | dirfd ≥ n, a path, flags 0 or `AT_SYMLINK_NOFOLLOW` | fs-rw |
+| `ftruncate`, `fsync`, `fdatasync`, `pwrite64` | fd ≥ n | fs-rw |
+| `fallocate` | fd ≥ n, mode 0 | fs-rw |
+| `socket` | `AF_INET`/`AF_INET6`, `SOCK_STREAM`/`SOCK_DGRAM` (with `SOCK_NONBLOCK`, `SOCK_CLOEXEC`), protocol 0 | net |
+| `connect`, `bind`, `listen`, `getsockname`, `getpeername` | fd ≥ n | net |
+| `accept4` | fd ≥ n, flags of `SOCK_NONBLOCK \| SOCK_CLOEXEC` | net |
+| `shutdown` | fd ≥ n, how up to `SHUT_RDWR` | net |
+| `sendto`, `recvfrom` | fd ≥ n, flags of `MSG_DONTWAIT \| MSG_NOSIGNAL` | net |
+| `setsockopt`, `getsockopt` | fd ≥ n; `SO_REUSEADDR`, `SO_KEEPALIVE`, `SO_SNDBUF`, `SO_RCVBUF`, `TCP_NODELAY`, `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_KEEPCNT`, `IPV6_V6ONLY` (get: `SO_ERROR` too) | net |
 
 A plugin's own host process (a file server, a network provider) is confined by its own Landlock rules and proven filter; when enabled it is part of the TCB, but this crate's guarantee covers the sandbox only.
 
@@ -71,10 +92,11 @@ The filter is `policy()`, one Rust function: the gate check, then the table's ro
 | Guarantee | Where | Verify |
 |---|---|---|
 | policy | `src/filter.rs` `policy()` | is the intended policy: the gate check returns only TRAP or KILL; each row pins every argument it needs; nothing creates an fd or a mapping |
-| proof | `src/filter.rs` (`seccomp_fn_verify::policy!`) | `cargo kani -p unsharek-tcb` proves `policy_proof::*`, one harness per mode and plugin on/off; the release build depends on it |
+| proof | `src/filter.rs` (`seccomp_fn_verify::policy!`) | `cargo kani -p unsharek-tcb` proves `policy_proof::*`, one harness per mode, fs access and net on/off; the release build depends on it |
 | one thread | `src/lockdown.rs` | counted before any other check |
 | fds | `src/lockdown.rs` | the guest's kinds checked; everything else closed |
-| control socket (plugin) | `src/lockdown.rs` | AF_UNIX `SOCK_SEQPACKET`, checked before the filter; the `recvmsg` row pins fd and flags; the floor below received fds filled |
+| fd floor | `src/lockdown.rs` | the kept fds renumbered `0..n`, everything at or above `n` closed; every plugin row's fd and dirfd `>= n`, no `AT_EMPTY_PATH` |
+| roots (plugin: fs) | `src/lockdown.rs` | Landlock ruleset of the roots, after `no_new_privs`, before the filter; refused without Landlock or its needed ABI unless `no_landlock` |
 | mappings | `src/lockdown.rs` | no writable shared mapping of a file |
 | core dumps, capabilities, `no_new_privs` | `src/lockdown.rs` | set before the filter |
 | filter install | `src/lockdown.rs` | `TSYNC`; a failure is an error |

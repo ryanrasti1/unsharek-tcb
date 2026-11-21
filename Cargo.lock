@@ -64,7 +64,7 @@ dependencies = [
 [[package]]
 name = "seccomp-fn"
 version = "0.0.0"
-source = "git+ssh://git@github.com/ryanrasti1/seccomp-fn.git?rev=7b97a4de887ead0d28ccd23c507f2c346e2e4df7#7b97a4de887ead0d28ccd23c507f2c346e2e4df7"
+source = "git+ssh://git@github.com/ryanrasti1/seccomp-fn.git?rev=1454485e69ff266c1be968822579b0e3f2c1fa07#1454485e69ff266c1be968822579b0e3f2c1fa07"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -74,7 +74,7 @@ dependencies = [
 [[package]]
 name = "seccomp-fn-verify"
 version = "0.0.0"
-source = "git+ssh://git@github.com/ryanrasti1/seccomp-fn.git?rev=7b97a4de887ead0d28ccd23c507f2c346e2e4df7#7b97a4de887ead0d28ccd23c507f2c346e2e4df7"
+source = "git+ssh://git@github.com/ryanrasti1/seccomp-fn.git?rev=1454485e69ff266c1be968822579b0e3f2c1fa07#1454485e69ff266c1be968822579b0e3f2c1fa07"
 dependencies = [
  "libc",
 ]
