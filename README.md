@@ -29,7 +29,6 @@ Plugins (experimental) widen the table only when the caller enables them, and on
 |---|---|---|
 | `close` | fd ≥ n (one a plugin opened) | fs, net |
 | `openat` | dirfd ≥ n; always `O_NONBLOCK \| O_CLOEXEC`; `O_RDONLY` with `O_DIRECTORY`, `O_NOFOLLOW`; read-write also `O_WRONLY`/`O_RDWR` with `O_TRUNC`, `O_APPEND`, `O_CREAT` (`O_EXCL`); mode without `S_ISUID`/`S_ISGID`; never `O_PATH`, `O_TMPFILE`, `O_DIRECT` | fs |
-| `lseek` | fd ≥ n, whence up to `SEEK_HOLE` | fs |
 | `fstat`, `getdents64`, `fstatfs`, `pread64` | fd ≥ n | fs |
 | `newfstatat` | dirfd ≥ n, flags 0 or `AT_SYMLINK_NOFOLLOW` | fs |
 | `statx` | dirfd ≥ n, flags 0 or `AT_SYMLINK_NOFOLLOW` | fs |

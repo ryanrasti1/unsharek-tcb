@@ -94,7 +94,6 @@ fn nr(name: &str) -> u32 {
         "exit" => libc::SYS_exit,
         "close" => libc::SYS_close,
         "openat" => libc::SYS_openat,
-        "lseek" => libc::SYS_lseek,
         "fstat" => libc::SYS_fstat,
         "getdents64" => libc::SYS_getdents64,
         "fstatfs" => libc::SYS_fstatfs,
@@ -176,7 +175,7 @@ fn readme_table_is_the_policy() {
             }
         }
     }
-    assert_eq!(lines.len(), 29, "README.md's allowlist tables: their rows (6 core, 23 plugin)");
+    assert_eq!(lines.len(), 28, "README.md's allowlist tables: their rows (6 core, 22 plugin)");
 }
 
 /// The program's length in each mode and plugin choice (the kernel takes 4096).
@@ -321,8 +320,10 @@ fn openat_row() {
 
 #[test]
 fn fs_fd_rows() {
-    row(RO, &[NONE, NET], call(libc::SYS_lseek, [N, 0, libc::SEEK_HOLE as u64, 0, 0, 0]), &[0]);
-    refused(RO, call(libc::SYS_lseek, [N, 0, 0, 0, 0, 0]), 2, &[5, u64::MAX]);
+    // No lseek: files are read at offsets (pread64), never through the host's shared offset.
+    for on in [RO, RW] {
+        assert!(!allowed(on.0, on.1, &call(libc::SYS_lseek, [N, 0, 0, 0, 0, 0])), "lseek");
+    }
     for nr in [libc::SYS_fstat, libc::SYS_getdents64, libc::SYS_fstatfs, libc::SYS_pread64] {
         row(RO, &[NONE, NET], call(nr, [N, 0x1000, 0, 0, 0, 0]), &[0]);
     }

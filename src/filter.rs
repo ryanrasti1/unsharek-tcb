@@ -24,7 +24,7 @@ use crate::{Fs, Mode};
 use libc::{
     SYS_accept4, SYS_bind, SYS_clone, SYS_close, SYS_connect, SYS_exit, SYS_exit_group, SYS_fallocate, SYS_fchmodat,
     SYS_fchownat, SYS_fcntl, SYS_fdatasync, SYS_fstat, SYS_fstatfs, SYS_fsync, SYS_ftruncate, SYS_getdents64,
-    SYS_getpeername, SYS_getsockname, SYS_getsockopt, SYS_linkat, SYS_listen, SYS_lseek, SYS_mkdirat, SYS_newfstatat,
+    SYS_getpeername, SYS_getsockname, SYS_getsockopt, SYS_linkat, SYS_listen, SYS_mkdirat, SYS_newfstatat,
     SYS_openat, SYS_ppoll, SYS_pread64, SYS_pwrite64, SYS_read, SYS_readlinkat, SYS_recvfrom, SYS_renameat2,
     SYS_rt_sigreturn, SYS_sendto, SYS_setsockopt, SYS_shutdown, SYS_socket, SYS_statx, SYS_symlinkat, SYS_unlinkat,
     SYS_utimensat, SYS_write,
@@ -47,7 +47,6 @@ const O_NB: u64 = O_NONBLOCK | O_CLOEXEC;
 const AT_SYMLINK_NOFOLLOW: u64 = libc::AT_SYMLINK_NOFOLLOW as u64;
 const AT_SYMLINK_FOLLOW: u64 = libc::AT_SYMLINK_FOLLOW as u64;
 const AT_REMOVEDIR: u64 = libc::AT_REMOVEDIR as u64;
-const SEEK_HOLE: u64 = libc::SEEK_HOLE as u64;
 const F_GETFL: u64 = libc::F_GETFL as u64;
 const F_SETFL: u64 = libc::F_SETFL as u64;
 const AF_INET: u64 = libc::AF_INET as u64;
@@ -194,9 +193,10 @@ pub fn policy(mode: Mode, n: u64, ppoll_max: u64, gate: u64, fs: Fs, net: bool) 
             {
                 SECCOMP_RET_ALLOW
             }
-            // Plugin: fs. An opened file's offset, whence `SEEK_SET` to `SEEK_HOLE`.
-            SYS_lseek if files && d.args[0] >= n && d.args[0] <= INT_MAX && d.args[2] <= SEEK_HOLE => SECCOMP_RET_ALLOW,
-            // Plugin: fs. An opened file's metadata, entries and bytes at an offset.
+            // Plugin: fs. An opened file's metadata, entries and bytes at an offset. No `lseek`:
+            // files are read and written only with `pread64`/`pwrite64` (read-write), at offsets
+            // the guest kernel keeps, so the host's shared offset is never used and no host
+            // thread's seek races another's read; `read`/`write` are for sockets and stdio.
             SYS_fstat | SYS_getdents64 | SYS_fstatfs | SYS_pread64 if files && d.args[0] >= n && d.args[0] <= INT_MAX => {
                 SECCOMP_RET_ALLOW
             }
