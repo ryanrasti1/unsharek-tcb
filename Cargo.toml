@@ -6,7 +6,7 @@ description = "Lockdown for an in-process sandbox: checks the process's threads,
 # (unsharek's workspace patches it to its submodule).
 edition = "2024"
 rust-version = "1.88"
-license = "GPL-2.0-only"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 # The filter, a Rust function compiled to classic BPF (seccomp-fn: not trusted) and proven
