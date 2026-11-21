@@ -119,7 +119,7 @@ fn readme_table_is_the_policy() {
         assert_eq!(table, ruled(mode), "{mode:?}: README.md's table against the policy");
         assert_eq!(ordered, program_rows(mode), "{mode:?}: README.md's rows against the policy's, in order");
     }
-    assert_eq!(rows, 7, "README.md's allowlist table: its rows");
+    assert_eq!(rows, 9, "README.md's allowlist tables: their rows (7 core, 2 plugin)");
 }
 
 /// The program's length in each mode.
