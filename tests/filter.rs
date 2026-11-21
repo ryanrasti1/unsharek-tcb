@@ -175,7 +175,7 @@ fn readme_table_is_the_policy() {
             }
         }
     }
-    assert_eq!(lines.len(), 28, "README.md's allowlist tables: their rows (6 core, 22 plugin)");
+    assert_eq!(lines.len(), 22, "README.md's allowlist tables: their rows (6 core, 16 plugin)");
 }
 
 /// The program's length in each mode and plugin choice (the kernel takes 4096).
@@ -320,30 +320,15 @@ fn openat_row() {
 
 #[test]
 fn fs_fd_rows() {
-    // No lseek: files are read at offsets (pread64), never through the host's shared offset.
-    for on in [RO, RW] {
-        assert!(!allowed(on.0, on.1, &call(libc::SYS_lseek, [N, 0, 0, 0, 0, 0])), "lseek");
-    }
-    for nr in [libc::SYS_fstat, libc::SYS_getdents64, libc::SYS_fstatfs, libc::SYS_pread64] {
+    for nr in [libc::SYS_fstat, libc::SYS_getdents64, libc::SYS_pread64] {
         row(RO, &[NONE, NET], call(nr, [N, 0x1000, 0, 0, 0, 0]), &[0]);
     }
-    for (nr, flags_at) in [(libc::SYS_newfstatat, 3), (libc::SYS_statx, 2)] {
-        let mut d = call(nr, [N, 0x1000, 0, 0, 0, 0]);
-        row(RO, &[NONE, NET], d, &[0]);
-        d.args[flags_at] = libc::AT_SYMLINK_NOFOLLOW as u64;
-        assert!(allowed(RO.0, RO.1, &d));
-        refused(RO, d, flags_at, &[libc::AT_EMPTY_PATH as u64, (libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW) as u64, 0x800]);
-    }
     row(RO, &[NONE, NET], call(libc::SYS_readlinkat, [N, 0x1000, 0x2000, 64, 0, 0]), &[0]);
-    // fcntl: F_GETFL; F_SETFL to O_NONBLOCK or 0 (read-write: O_APPEND too); nothing else.
-    let fc = |cmd: i32, arg: i32| call(libc::SYS_fcntl, [N, cmd as u64, arg as u64, 0, 0, 0]);
-    row(RO, &[NONE, NET], fc(libc::F_GETFL, 0), &[0]);
-    row(RO, &[NONE, NET], fc(libc::F_SETFL, 0), &[0]);
-    row(RO, &[NONE, NET], fc(libc::F_SETFL, libc::O_NONBLOCK), &[0]);
-    row(RW, &[NONE, RO, NET], fc(libc::F_SETFL, libc::O_APPEND | libc::O_NONBLOCK), &[0]);
+    // Not rows: stat is openat then fstat, the guest fakes statfs, offsets are pread64's, and a
+    // file's flags are fixed at open.
     for on in [RO, RW] {
-        for (cmd, arg) in [(libc::F_SETFL, libc::O_ASYNC), (libc::F_SETFL, libc::O_DIRECT), (libc::F_SETLK, 0), (libc::F_DUPFD, 0), (libc::F_SETOWN, 1)] {
-            assert!(!allowed(on.0, on.1, &fc(cmd, arg)), "fcntl {cmd} {arg:#x}");
+        for nr in [libc::SYS_lseek, libc::SYS_statx, libc::SYS_newfstatat, libc::SYS_fstatfs, libc::SYS_fcntl, libc::SYS_faccessat2, libc::SYS_flock] {
+            assert!(!allowed(on.0, on.1, &call(nr, [N, 0x1000, 0, 0, 0, 0])), "{nr}");
         }
     }
 }
@@ -359,19 +344,16 @@ fn fs_rw_rows() {
     refused(RW, call(libc::SYS_unlinkat, [N, 0x1000, 0, 0, 0, 0]), 2, &[1, libc::AT_EMPTY_PATH as u64]);
     rw(call(libc::SYS_renameat2, [N, 0x1000, N + 1, 0x2000, 2, 0]), &[0, 2]);
     refused(RW, call(libc::SYS_renameat2, [N, 0x1000, N, 0x2000, 0, 0]), 4, &[3, 4, 1 << 32]);
-    rw(call(libc::SYS_linkat, [N, 0x1000, N, 0x2000, libc::AT_SYMLINK_FOLLOW as u64, 0]), &[0, 2]);
-    refused(RW, call(libc::SYS_linkat, [N, 0x1000, N, 0x2000, 0, 0]), 4, &[libc::AT_EMPTY_PATH as u64]);
     rw(call(libc::SYS_symlinkat, [0x1000, N, 0x2000, 0, 0, 0]), &[1]);
-    rw(call(libc::SYS_fchownat, [N, 0x1000, 1000, 1000, libc::AT_SYMLINK_NOFOLLOW as u64, 0]), &[0]);
-    refused(RW, call(libc::SYS_fchownat, [N, 0x1000, 1000, 1000, 0, 0]), 4, &[libc::AT_EMPTY_PATH as u64]);
-    rw(call(libc::SYS_utimensat, [N, 0x1000, 0, 0, 0, 0]), &[0]);
+    rw(call(libc::SYS_utimensat, [N, 0x1000, 0, libc::AT_SYMLINK_NOFOLLOW as u64, 0, 0]), &[0]);
     refused(RW, call(libc::SYS_utimensat, [N, 0x1000, 0, 0, 0, 0]), 1, &[0]);
     refused(RW, call(libc::SYS_utimensat, [N, 0x1000, 0, 0, 0, 0]), 3, &[libc::AT_EMPTY_PATH as u64]);
-    for nr in [libc::SYS_ftruncate, libc::SYS_fsync, libc::SYS_fdatasync, libc::SYS_pwrite64] {
+    for nr in [libc::SYS_ftruncate, libc::SYS_fsync, libc::SYS_pwrite64] {
         rw(call(nr, [N, 0, 0, 0, 0, 0]), &[0]);
     }
-    rw(call(libc::SYS_fallocate, [N, 0, 0, 4096, 0, 0]), &[0]);
-    refused(RW, call(libc::SYS_fallocate, [N, 0, 0, 4096, 0, 0]), 1, &[libc::FALLOC_FL_PUNCH_HOLE as u64 | 1, 1]);
+    for nr in [libc::SYS_fchownat, libc::SYS_linkat, libc::SYS_fallocate, libc::SYS_fdatasync, libc::SYS_lseek, libc::SYS_fcntl] {
+        assert!(!allowed(RW.0, RW.1, &call(nr, [N, 0x1000, N, 0x2000, 0, 0])), "{nr}");
+    }
 }
 
 #[test]
@@ -394,37 +376,30 @@ fn net_rows() {
     refused(NET, call(libc::SYS_accept4, [N, 0, 0, 0, 0, 0]), 3, &[1, 1 << 32]);
     net(call(libc::SYS_shutdown, [N, libc::SHUT_RDWR as u64, 0, 0, 0, 0]), &[0]);
     refused(NET, call(libc::SYS_shutdown, [N, 0, 0, 0, 0, 0]), 1, &[3]);
-    for nr in [libc::SYS_sendto, libc::SYS_recvfrom] {
-        let d = call(nr, [N, 0x1000, 10, (libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) as u64, 0, 0]);
-        net(d, &[0]);
-        refused(NET, d, 3, &[libc::MSG_OOB as u64, libc::MSG_ERRQUEUE as u64, libc::MSG_ZEROCOPY as u64, libc::MSG_PEEK as u64]);
+    // Data over read and write only: UDP is always connected.
+    for nr in [libc::SYS_sendto, libc::SYS_recvfrom, libc::SYS_sendmsg, libc::SYS_recvmsg] {
+        assert!(!allowed(NET.0, NET.1, &call(nr, [N, 0x1000, 10, 0, 0, 0])), "{nr}");
     }
     let so = |nr: i64, level: i32, opt: i32| call(nr, [N, level as u64, opt as u64, 0x1000, 4, 0]);
-    for nr in [libc::SYS_setsockopt, libc::SYS_getsockopt] {
-        for (level, opt) in [
-            (libc::SOL_SOCKET, libc::SO_REUSEADDR),
-            (libc::SOL_SOCKET, libc::SO_KEEPALIVE),
-            (libc::SOL_SOCKET, libc::SO_SNDBUF),
-            (libc::SOL_SOCKET, libc::SO_RCVBUF),
-            (libc::IPPROTO_TCP, libc::TCP_NODELAY),
-            (libc::IPPROTO_TCP, libc::TCP_KEEPIDLE),
-            (libc::IPPROTO_TCP, libc::TCP_KEEPINTVL),
-            (libc::IPPROTO_TCP, libc::TCP_KEEPCNT),
-            (libc::IPPROTO_IPV6, libc::IPV6_V6ONLY),
-        ] {
-            net(so(nr, level, opt), &[0]);
-        }
-        for (level, opt) in [
-            (libc::SOL_SOCKET, libc::SO_REUSEPORT),
-            (libc::SOL_SOCKET, libc::SO_RCVBUFFORCE),
-            (libc::SOL_SOCKET, libc::SO_ATTACH_FILTER),
-            (libc::SOL_SOCKET, libc::SO_BINDTODEVICE),
-            (libc::IPPROTO_IP, libc::IP_TRANSPARENT),
-            (libc::IPPROTO_TCP, libc::SO_REUSEADDR + 100),
-        ] {
-            assert!(!allowed(NET.0, NET.1, &so(nr, level, opt)), "{nr} {level} {opt}");
-        }
+    for (level, opt) in [
+        (libc::SOL_SOCKET, libc::SO_REUSEADDR),
+        (libc::SOL_SOCKET, libc::SO_KEEPALIVE),
+        (libc::IPPROTO_TCP, libc::TCP_NODELAY),
+        (libc::IPPROTO_IPV6, libc::IPV6_V6ONLY),
+    ] {
+        net(so(libc::SYS_setsockopt, level, opt), &[0]);
+        assert!(!allowed(NET.0, NET.1, &so(libc::SYS_getsockopt, level, opt)), "get {level} {opt}");
     }
-    assert!(allowed(NET.0, NET.1, &so(libc::SYS_getsockopt, libc::SOL_SOCKET, libc::SO_ERROR)));
-    assert!(!allowed(NET.0, NET.1, &so(libc::SYS_setsockopt, libc::SOL_SOCKET, libc::SO_ERROR)));
+    for (level, opt) in [
+        (libc::SOL_SOCKET, libc::SO_REUSEPORT),
+        (libc::SOL_SOCKET, libc::SO_RCVBUFFORCE),
+        (libc::SOL_SOCKET, libc::SO_SNDBUF),
+        (libc::SOL_SOCKET, libc::SO_ATTACH_FILTER),
+        (libc::SOL_SOCKET, libc::SO_BINDTODEVICE),
+        (libc::IPPROTO_IP, libc::IP_TRANSPARENT),
+        (libc::SOL_SOCKET, libc::SO_ERROR),
+    ] {
+        assert!(!allowed(NET.0, NET.1, &so(libc::SYS_setsockopt, level, opt)), "{level} {opt}");
+    }
+    net(so(libc::SYS_getsockopt, libc::SOL_SOCKET, libc::SO_ERROR), &[0]);
 }

@@ -789,11 +789,10 @@ fn net_sockets_work() {
         // SAFETY: accept4 from the gate.
         let s = unsafe { gate(libc::SYS_accept4 as usize, l as usize, 0, 0, libc::SOCK_CLOEXEC as usize, 0, 0) };
         let msg = *b"hi";
-        // SAFETY: sendto/recvfrom from the gate.
-        let sent = unsafe { gate(libc::SYS_sendto as usize, c as usize, msg.as_ptr() as usize, 2, libc::MSG_NOSIGNAL as usize, 0, 0) };
+        // Data over write and read (no sendto, recvfrom).
+        let sent = g(libc::SYS_write, [c as usize, msg.as_ptr() as usize, 2]);
         let mut b = [0u8; 2];
-        // SAFETY: as above.
-        let got = unsafe { gate(libc::SYS_recvfrom as usize, s as usize, b.as_mut_ptr() as usize, 2, 0, 0, 0) };
+        let got = g(libc::SYS_read, [s as usize, b.as_mut_ptr() as usize, 2]);
         if s < 0 || sent != 2 || got != 2 || b != msg {
             return 5;
         }

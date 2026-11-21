@@ -29,26 +29,20 @@ Plugins (experimental) widen the table only when the caller enables them, and on
 |---|---|---|
 | `close` | fd ≥ n (one a plugin opened) | fs, net |
 | `openat` | dirfd ≥ n; always `O_NONBLOCK \| O_CLOEXEC`; `O_RDONLY` with `O_DIRECTORY`, `O_NOFOLLOW`; read-write also `O_WRONLY`/`O_RDWR` with `O_TRUNC`, `O_APPEND`, `O_CREAT` (`O_EXCL`); mode without `S_ISUID`/`S_ISGID`; never `O_PATH`, `O_TMPFILE`, `O_DIRECT` | fs |
-| `fstat`, `getdents64`, `fstatfs`, `pread64` | fd ≥ n | fs |
-| `newfstatat` | dirfd ≥ n, flags 0 or `AT_SYMLINK_NOFOLLOW` | fs |
-| `statx` | dirfd ≥ n, flags 0 or `AT_SYMLINK_NOFOLLOW` | fs |
+| `fstat`, `getdents64`, `pread64` | fd ≥ n | fs |
 | `readlinkat` | dirfd ≥ n | fs |
-| `fcntl` | fd ≥ n; `F_GETFL`, or `F_SETFL` to 0 or `O_NONBLOCK` (read-write: with `O_APPEND`) | fs |
 | `mkdirat`, `fchmodat` | dirfd ≥ n, mode without `S_ISUID`/`S_ISGID` | fs-rw |
 | `unlinkat` | dirfd ≥ n, flags 0 or `AT_REMOVEDIR` | fs-rw |
 | `renameat2` | both dirfds ≥ n, flags 0, `RENAME_NOREPLACE` or `RENAME_EXCHANGE` | fs-rw |
-| `linkat` | both dirfds ≥ n, flags 0 or `AT_SYMLINK_FOLLOW` | fs-rw |
 | `symlinkat` | dirfd ≥ n | fs-rw |
-| `fchownat` | dirfd ≥ n, flags 0 or `AT_SYMLINK_NOFOLLOW` | fs-rw |
 | `utimensat` | dirfd ≥ n, a path, flags 0 or `AT_SYMLINK_NOFOLLOW` | fs-rw |
-| `ftruncate`, `fsync`, `fdatasync`, `pwrite64` | fd ≥ n | fs-rw |
-| `fallocate` | fd ≥ n, mode 0 | fs-rw |
+| `ftruncate`, `fsync`, `pwrite64` | fd ≥ n | fs-rw |
 | `socket` | `AF_INET`/`AF_INET6`, `SOCK_STREAM`/`SOCK_DGRAM` (with `SOCK_NONBLOCK`, `SOCK_CLOEXEC`), protocol 0 | net |
 | `connect`, `bind`, `listen`, `getsockname`, `getpeername` | fd ≥ n | net |
 | `accept4` | fd ≥ n, flags of `SOCK_NONBLOCK \| SOCK_CLOEXEC` | net |
 | `shutdown` | fd ≥ n, how up to `SHUT_RDWR` | net |
-| `sendto`, `recvfrom` | fd ≥ n, flags of `MSG_DONTWAIT \| MSG_NOSIGNAL` | net |
-| `setsockopt`, `getsockopt` | fd ≥ n; `SO_REUSEADDR`, `SO_KEEPALIVE`, `SO_SNDBUF`, `SO_RCVBUF`, `TCP_NODELAY`, `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_KEEPCNT`, `IPV6_V6ONLY` (get: `SO_ERROR` too) | net |
+| `setsockopt` | fd ≥ n; `SO_REUSEADDR`, `SO_KEEPALIVE`, `TCP_NODELAY`, `IPV6_V6ONLY` | net |
+| `getsockopt` | fd ≥ n; `SO_ERROR` | net |
 
 A plugin's own host process (a file server, a network provider) is confined by its own Landlock rules and proven filter; when enabled it is part of the TCB, but this crate's guarantee covers the sandbox only.
 
