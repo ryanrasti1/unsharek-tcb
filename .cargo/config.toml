@@ -1,0 +1,3 @@
+# The seccomp-fn dependency is fetched over ssh, as git itself does it.
+[net]
+git-fetch-with-cli = true
