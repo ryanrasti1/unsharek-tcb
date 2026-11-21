@@ -5,7 +5,7 @@
 
 use std::os::fd::RawFd;
 
-use unsharek_tcb::{Config, Confined, Error, Mode, Sandbox};
+use unsharek_tcb::{Config, Confined, Error, Mode};
 
 /// The test's gate: `nr(a0, a1, a2)`, raw result.
 #[unsafe(naked)]
@@ -39,8 +39,11 @@ struct Guest {
 }
 
 impl Confined for Guest {
-    fn host_fds(&self) -> &[RawFd] {
-        &self.fds
+    fn host_fds(&self) -> Vec<RawFd> {
+        self.fds.clone()
+    }
+    fn mode(&self) -> Mode {
+        self.mode
     }
     fn gate_ip(&self) -> u64 {
         &raw const unsharek_tcb_ctl_gate_ret as u64
@@ -48,14 +51,10 @@ impl Confined for Guest {
 }
 
 fn lockdown(guest: &Guest, grants: impl FnOnce(&mut Config)) -> unsharek_tcb::Result<()> {
-    Sandbox::configure_and_lockdown(
-        |s| {
-            s.mode = guest.mode;
-            grants(s);
-            Ok(())
-        },
-        guest,
-    )
+    unsharek_tcb::register(Box::leak(Box::new(Guest { fds: guest.fds.clone(), mode: guest.mode })));
+    let mut c = Config::default();
+    grants(&mut c);
+    unsharek_tcb::lockdown(c)
 }
 
 fn eventfd() -> RawFd {

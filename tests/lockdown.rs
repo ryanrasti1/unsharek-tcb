@@ -6,7 +6,7 @@
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
-use unsharek_tcb::{Config, Confined, Error, Mode, Sandbox};
+use unsharek_tcb::{Config, Confined, Error, Mode};
 
 // ------------------------------------------------------------------------------------------------
 // A gate, and a SIGSYS handler that returns through it.
@@ -98,8 +98,11 @@ struct Guest {
 }
 
 impl Confined for Guest {
-    fn host_fds(&self) -> &[RawFd] {
-        &self.fds
+    fn host_fds(&self) -> Vec<RawFd> {
+        self.fds.clone()
+    }
+    fn mode(&self) -> Mode {
+        self.mode
     }
     fn gate_ip(&self) -> u64 {
         gate_ip()
@@ -108,14 +111,10 @@ impl Confined for Guest {
 
 /// Lockdown for `guest`, in its mode, with the grants `grants` makes.
 fn lockdown(guest: &Guest, grants: impl FnOnce(&mut Config)) -> unsharek_tcb::Result<()> {
-    Sandbox::configure_and_lockdown(
-        |s| {
-            s.mode = guest.mode;
-            grants(s);
-            Ok(())
-        },
-        guest,
-    )
+    unsharek_tcb::register(Box::leak(Box::new(Guest { fds: guest.fds.clone(), mode: guest.mode })));
+    let mut c = Config::default();
+    grants(&mut c);
+    unsharek_tcb::lockdown(c)
 }
 
 fn eventfd() -> RawFd {
@@ -250,13 +249,9 @@ fn no_core_dumps() {
     assert!(pid >= 0);
     if pid == 0 {
         let guest = Guest { fds: vec![], mode: Mode::Coroutine };
-        let ok = Sandbox::configure_and_lockdown(
-            |s| {
-                s.grant(p[0]).grant(q[1]);
-                Ok(())
-            },
-            &guest,
-        )
+        let ok = lockdown(&guest, |s| {
+            s.grant(p[0]).grant(q[1]);
+        })
         .is_ok();
         let b = [ok as u8];
         g(libc::SYS_write, [q[1] as usize, b.as_ptr() as usize, 1]);
@@ -424,13 +419,9 @@ fn refuses_a_second_thread() {
 #[test]
 fn refuses_a_closed_grant() {
     let got = exit_code(in_child(|| {
-        match Sandbox::configure_and_lockdown(
-            |s| {
-                s.grant(900);
-                Ok(())
-            },
-            &Guest { fds: vec![], mode: Mode::Coroutine },
-        ) {
+        match lockdown(&Guest { fds: vec![], mode: Mode::Coroutine }, |s| {
+            s.grant(900);
+        }) {
             Err(Error::NotOpen(900)) => 0,
             _ => 1,
         }

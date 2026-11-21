@@ -1,5 +1,5 @@
 //! Lockdown: the moment the process stops being the host's. [`lockdown`] makes the steps of
-//! `Sandbox::configure_and_lockdown`'s comment (and README.md's "Design"), in its order, with ordinary syscalls (nothing
+//! `crate::lockdown`'s comment (and README.md's "Design"), in its order, with ordinary syscalls (nothing
 //! traps yet: no filter is in). The first check is the thread count, so nothing can open an fd,
 //! map memory or make a thread behind the later ones.
 
@@ -40,7 +40,7 @@ pub fn check_ns() -> u64 {
 
 pub(crate) fn lockdown<C: Confined + ?Sized>(config: Config, guest: &C) -> Result<()> {
     let mode = config.mode;
-    let guest_fds: Vec<RawFd> = guest.host_fds().to_vec();
+    let guest_fds: Vec<RawFd> = guest.host_fds();
     let grants = config.fds.clone();
     // The kept fds: the grants, and the guest's. The filter is compiled first: it allocates,
     // and checks nothing.
