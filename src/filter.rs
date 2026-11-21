@@ -1,9 +1,9 @@
 //! The filter: which host syscalls the process may make after lockdown, each argument pinned.
 //! [`policy`] is the whole of it, as a plain Rust function of a call (`d`) and the [`Config`]'s
-//! mode, fd floor and `ppoll_max`, and the gate's address; `seccomp_fn::compile!`
+//! mode, fd floor and `ppoll_max`, and the gate's address; `seccomp_fn::bpf!`
 //! compiles it to classic BPF ([`filter`]), and Kani proves the program gives the function's
 //! verdict on every call, for every mode, floor, bound and gate (`cargo kani`:
-//! seccomp-fn-verify's harness, `filter::policy_proof::policy_is_filter`). The compiler isn't
+//! seccomp-fn-verify's harnesses, `filter::proof::*`). The compiler isn't
 //! trusted: the proof checks its output.
 //! [`crate::lockdown`] installs it.
 //!
@@ -288,18 +288,22 @@ pub fn policy(mode: Mode, n: u64, ppoll_max: u64, gate: u64, fs: Fs, net: bool) 
     }
 }
 
-// The proof: a harness per mode (one with the mode symbolic took 5x as long: 663 s against
-// 131 s), every other param symbolic.
-seccomp_fn_verify::policy!(policy, filter, unwind = 1024, (
-    Mode = [coroutine: Coroutine, threaded: Threaded, fork: Fork], _, _, _,
-    Fs = [no_fs: Off, fs_ro: ReadOnly, fs_rw: ReadWrite],
-    bool = [no_net: false, net: true]
-));
+// The proof: a harness per mode and plugin choice (a mode symbolic took 5x as long as one
+// fixed: 663 s against 131 s), the floor, bound and gate symbolic (`filter::proof::*`).
+#[cfg(kani)]
+mod proof {
+    use super::*;
+    seccomp_fn_verify::prove!(policy, filter, unwind = 1024, (
+        Mode = [coroutine: Coroutine, threaded: Threaded, fork: Fork], _, _, _,
+        Fs = [no_fs: Off, fs_ro: ReadOnly, fs_rw: ReadWrite],
+        bool = [no_net: false, net: true]
+    ));
+}
 
 /// The filter for `mode`, the fd floor `n` ([`crate::Fds::n`]), `ppoll_max`, the gate
 /// ([`crate::Config::gate`]) and the plugins ([`crate::Config::fs_root`], [`crate::Config::net`]):
 /// [`policy`]'s program.
 /// Public, so the exact program can be inspected and tested.
 pub fn filter(mode: Mode, n: u64, ppoll_max: u64, gate: u64, fs: Fs, net: bool) -> Vec<sock_filter> {
-    seccomp_fn::compile!(policy(mode, n, ppoll_max, gate, fs, net))
+    seccomp_fn::bpf!(policy(mode, n, ppoll_max, gate, fs, net))
 }

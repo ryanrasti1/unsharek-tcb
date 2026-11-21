@@ -85,7 +85,7 @@ The filter is `policy()`, one Rust function: the gate check, then the table's ro
 | Guarantee | Where | Verify |
 |---|---|---|
 | policy | `src/filter.rs` `policy()` | is the intended policy: the gate check returns only TRAP or KILL; each row pins every argument it needs; nothing creates an fd or a mapping |
-| proof | `src/filter.rs` (`seccomp_fn_verify::policy!`) | `cargo kani -p unsharek-tcb` proves `policy_proof::*`, one harness per mode, fs access and net on/off; the release build depends on it |
+| proof | `src/filter.rs` (`seccomp_fn_verify::prove!`) | `cargo kani -p unsharek-tcb` proves `proof::*`, one harness per mode, fs access and net on/off; the release build depends on it |
 | one thread | `src/lockdown.rs` | counted before any other check |
 | fds | `src/lockdown.rs` | the guest's kinds checked; everything else closed |
 | fd floor | `src/lockdown.rs` | the kept fds renumbered `0..n`, everything at or above `n` closed; every plugin row's fd and dirfd `>= n`, no `AT_EMPTY_PATH` |

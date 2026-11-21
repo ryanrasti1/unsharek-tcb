@@ -11,8 +11,8 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 # The filter, a Rust function compiled to classic BPF (seccomp-fn: not trusted) and proven
 # equal to it (seccomp-fn-verify: the proof) (src/filter.rs)
-seccomp-fn = { git = "ssh://git@github.com/ryanrasti1/seccomp-fn.git", rev = "1454485e69ff266c1be968822579b0e3f2c1fa07" }
-seccomp-fn-verify = { git = "ssh://git@github.com/ryanrasti1/seccomp-fn.git", rev = "1454485e69ff266c1be968822579b0e3f2c1fa07" }
+seccomp-fn = { git = "ssh://git@github.com/ryanrasti1/seccomp-fn.git", rev = "874f736193d1c08db8b6afb3d133ad2a22362faf" }
+seccomp-fn-verify = { git = "ssh://git@github.com/ryanrasti1/seccomp-fn-verify.git", rev = "17782020e43557e9aa8ad27c98d95014d3e8c081" }
 # Lockdown's syscalls and constants
 libc = "0.2"
 # Typed wrappers for lockdown's syscalls but close_range and seccomp (raw syscalls, no libc)
