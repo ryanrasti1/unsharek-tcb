@@ -4,17 +4,18 @@
 //! map memory or make a thread behind the later ones.
 
 use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::{OwnedFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use libc::sock_filter as SockFilter;
+use rustix::fs::{Mode as FsMode, OFlags};
 use rustix::io::Errno;
 use rustix::process::{DumpableBehavior, Resource, Rlimit};
 use rustix::thread::{CapabilitySet, CapabilitySets};
 
 use crate::filter;
-use crate::{Config, Error, Mode, Result};
+use crate::{Config, Error, Fds, Mode, Result};
 
 fn os(what: &'static str) -> impl FnOnce(io::Error) -> Error {
     move |source| Error::Os { what, source }
@@ -29,7 +30,7 @@ fn rx(what: &'static str) -> impl FnOnce(Errno) -> Error {
     move |e| Error::Os { what, source: e.into() }
 }
 
-/// How long the last lockdown's checks (steps 1-4: threads, fds, mappings, the close) took, in ns: for
+/// How long the last lockdown's checks (steps 1-3: threads, fds, mappings) took, in ns: for
 /// measuring, not a policy.
 static CHECK_NS: AtomicU64 = AtomicU64::new(0);
 
@@ -38,67 +39,76 @@ pub fn check_ns() -> u64 {
     CHECK_NS.load(Ordering::Relaxed)
 }
 
-pub(crate) fn lockdown(config: Config) -> Result<()> {
+/// How long the last lockdown's paranoia check took, in ns (0: off).
+static PARANOIA_NS: AtomicU64 = AtomicU64::new(0);
+
+#[doc(hidden)]
+pub fn paranoia_ns() -> u64 {
+    PARANOIA_NS.load(Ordering::Relaxed)
+}
+
+pub(crate) fn lockdown(config: Config) -> Result<Fds> {
     let mode = config.mode;
     let gate = config.gate.ok_or(Error::NoGate)?;
     let guest_fds: Vec<RawFd> = config.guest_fds.clone();
     let grants = config.fds.clone();
-    // The kept fds: the grants, and the guest's. The filter is compiled first: it allocates,
-    // and checks nothing.
-    let mut all = config;
-    all.fds.extend(guest_fds.iter().copied());
-    all.fds.extend(all.recv_fds);
-    // Plugin: capnweb. Received fds may be closed: those at or above `floor`, one above every
-    // kept fd (step 4b leaves no free fd below it).
-    let floor = all.fds.iter().copied().max().unwrap_or(2).max(2) as u64 + 1;
-    let ctl = all.recv_fds.map(|fd| (fd as u64, floor));
-    let pid = rustix::process::getpid().as_raw_nonzero().get() as u32;
-    let prog = filter::filter(all.mode, pid as u64, all.ppoll_max, gate, ctl);
-
-    let t = Instant::now();
-    // The checks read /proc/self: it must be the kernel's procfs, not whatever is mounted there
-    // (a FUSE or tmpfs at /proc could answer anything).
-    proc_is_procfs()?;
-    // 1. One thread.
-    one_thread()?;
-    // 2. The guest's fds: an eventfd each (a CPU token), or in fork mode a pidfd (init's: each
-    // forked process polls it to end with init; PR_SET_PDEATHSIG would need a prctl after
-    // lockdown, and the pidfd is only polled: no pidfd_send_signal or waitid is allowed).
-    // Nothing else: a file, a socket, a pipe posing as one would get read and write without the
-    // caller's grant.
-    for &fd in &guest_fds {
-        let kind = fd_kind(fd).map_err(|_| Error::NotOpen(fd))?;
-        let ok = kind == "anon_inode:[eventfd]" || (mode == Mode::Fork && kind == "anon_inode:[pidfd]");
-        if !ok {
-            return Err(Error::FdKind { fd, kind });
-        }
-    }
-    for &fd in &grants {
-        // Open: /proc/self/fd has it, as for the guest's (no fd borrowed unsafely).
-        if fd < 0 || fd_kind(fd).is_err() {
-            return Err(Error::NotOpen(fd));
-        }
-    }
-    // Plugin: capnweb. The control socket is a unix seqpacket socket: `recvmsg` on it brings in
-    // only what its peer (the provider's process) sends, in whole messages.
-    if let Some(fd) = all.recv_fds {
-        control_socket(fd)?;
-    }
-    // 3. Every mapping.
-    check_maps(mode)?;
-    // 4. Every other fd closed, not refused (a CLI inherits stray fds): between and above the
-    // kept ones.
-    let mut keep: Vec<RawFd> = all.fds.clone();
+    // The kept fds: the grants, the guest's and the control socket, and their new numbers. The
+    // filter is compiled first (it allocates, and checks nothing), for the floor `n` and the
+    // control socket's new number.
+    let mut keep: Vec<RawFd> = grants.iter().chain(&guest_fds).chain(&config.recv_fds).copied().collect();
     keep.sort_unstable();
     keep.dedup();
-    close_except(&keep)?;
-    // 4b. Plugin: capnweb. Every free fd below the floor taken (/dev/null, read-only): the
-    // kernel hands out the lowest free number, so what `recvmsg` brings lands at or above it,
-    // and the `close` row (fd >= floor) reaches only those.
-    if all.recv_fds.is_some() {
-        fill_below(&keep, ctl.map_or(0, |c| c.1) as RawFd)?;
+    let fds = renumbered(&keep);
+    let ctl = config.recv_fds.map(|fd| fds.get(fd).unwrap_or(-1) as u64);
+    let prog = filter::filter(mode, fds.n as u64, config.ppoll_max, gate, ctl);
+
+    {
+        // Every read of /proc is through this one fd, checked to be the kernel's procfs (not
+        // whatever is mounted at /proc: a FUSE or tmpfs there could answer anything), and its
+        // process to be this one (step 1 finds this thread's tid in it). Closed before step 4.
+        let proc = proc_self()?;
+        // 0. The assumptions, best-effort.
+        if config.paranoia {
+            let t = Instant::now();
+            paranoia(&proc, mode, &keep)?;
+            PARANOIA_NS.store(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        } else {
+            PARANOIA_NS.store(0, Ordering::Relaxed);
+        }
+        let t = Instant::now();
+        // 1. One thread.
+        one_thread(&proc)?;
+        // 2. The guest's fds: an eventfd each (a CPU token), or in fork mode a pidfd (init's: each
+        // forked process polls it to end with init; PR_SET_PDEATHSIG would need a prctl after
+        // lockdown, and the pidfd is only polled: no pidfd_send_signal or waitid is allowed).
+        // Nothing else: a file, a socket, a pipe posing as one would get read and write without
+        // the caller's grant.
+        for &fd in &guest_fds {
+            let kind = fd_kind(&proc, fd).map_err(|_| Error::NotOpen(fd))?;
+            let ok = kind == "anon_inode:[eventfd]" || (mode == Mode::Fork && kind == "anon_inode:[pidfd]");
+            if !ok {
+                return Err(Error::FdKind { fd, kind });
+            }
+        }
+        for &fd in &grants {
+            // Open: /proc/self/fd has it, as for the guest's (no fd borrowed unsafely).
+            if fd < 0 || fd_kind(&proc, fd).is_err() {
+                return Err(Error::NotOpen(fd));
+            }
+        }
+        // Plugin: capnweb. The control socket is a unix seqpacket socket: `recvmsg` on it brings
+        // in only what its peer (the provider's process) sends, in whole messages.
+        if let Some(fd) = config.recv_fds {
+            control_socket(&proc, fd)?;
+        }
+        // 3. Every mapping.
+        check_maps(&proc, mode)?;
+        CHECK_NS.store(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
-    CHECK_NS.store(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    // 4. Every other fd closed, not refused (a CLI inherits stray fds), and the kept ones moved
+    // to `0..n`.
+    close_except(&keep)?;
+    compact(&fds)?;
     // 5. No core dump, not dumpable.
     rustix::process::setrlimit(Resource::Core, Rlimit { current: Some(0), maximum: Some(0) }).map_err(rx("RLIMIT_CORE"))?;
     rustix::process::set_dumpable_behavior(DumpableBehavior::NotDumpable).map_err(rx("PR_SET_DUMPABLE"))?;
@@ -107,29 +117,55 @@ pub(crate) fn lockdown(config: Config) -> Result<()> {
     // 7. no_new_privs: unprivileged seccomp needs it, and no exec gains anything after.
     rustix::thread::set_no_new_privs(true).map_err(rx("PR_SET_NO_NEW_PRIVS"))?;
     // 8. The filter, with TSYNC.
-    install(&prog)
+    install(&prog)?;
+    Ok(fds)
 }
 
-/// Open /dev/null at every fd below `floor` that isn't in `keep` (sorted): after
-/// [`close_except`] those are free, and each open takes the lowest.
-fn fill_below(keep: &[RawFd], floor: RawFd) -> Result<()> {
-    for fd in 0..floor {
-        if keep.binary_search(&fd).is_ok() {
+/// The kept fds' new numbers (`keep` sorted, deduplicated): those below `n` stay, the others
+/// take the free numbers below `n`, lowest first, in order.
+fn renumbered(keep: &[RawFd]) -> Fds {
+    let n = keep.len() as RawFd;
+    let mut free = (0..n).filter(|fd| keep.binary_search(fd).is_err());
+    let map = keep.iter().map(|&fd| (fd, if fd < n { fd } else { free.next().unwrap_or(fd) })).collect();
+    Fds { n, map }
+}
+
+/// Step 4's moves: each kept fd at or above `n` duplicated to its new number (close-on-exec as
+/// it was), then everything at or above `n` closed. After [`close_except`], so every new number
+/// is free; each is checked open after.
+fn compact(fds: &Fds) -> Result<()> {
+    for &(old, new) in &fds.map {
+        if old == new {
             continue;
         }
-        let f = rustix::fs::open("/dev/null", rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC, rustix::fs::Mode::empty())
-            .map_err(rx("/dev/null"))?;
-        let got = std::os::fd::IntoRawFd::into_raw_fd(f);
-        if got != fd {
-            return Err(Error::Os { what: "/dev/null", source: io::Error::other(format!("took fd {got}, wanted {fd}")) });
+        // SAFETY: fcntl and dup3 on this process's fds; `new` is free (step 4 closed it).
+        let fl = unsafe { libc::fcntl(old, libc::F_GETFD) };
+        if fl < 0 {
+            return Err(last_os("F_GETFD"));
+        }
+        let cloexec = if fl & libc::FD_CLOEXEC != 0 { libc::O_CLOEXEC } else { 0 };
+        // SAFETY: as above.
+        if unsafe { libc::dup3(old, new, cloexec) } != new {
+            return Err(last_os("dup3"));
+        }
+    }
+    let n = fds.n as u32;
+    // SAFETY: closes this process's fds at or above `n`: none is kept any more.
+    if unsafe { libc::syscall(libc::SYS_close_range, n, u32::MAX, 0) } != 0 {
+        return Err(last_os("close_range"));
+    }
+    for fd in 0..fds.n {
+        // SAFETY: fcntl on this process's fd.
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+            return Err(Error::NotOpen(fd));
         }
     }
     Ok(())
 }
 
 /// The control socket ([`Config::recv_fds`]): open, `AF_UNIX`, `SOCK_SEQPACKET`.
-fn control_socket(fd: RawFd) -> Result<()> {
-    if fd < 0 || fd_kind(fd).is_err() {
+fn control_socket(proc: &OwnedFd, fd: RawFd) -> Result<()> {
+    if fd < 0 || fd_kind(proc, fd).is_err() {
         return Err(Error::NotOpen(fd));
     }
     // SAFETY: `fd` is open (above), borrowed for the two getsockopts only.
@@ -137,31 +173,54 @@ fn control_socket(fd: RawFd) -> Result<()> {
     let (domain, kind) = (rustix::net::sockopt::socket_domain(s), rustix::net::sockopt::socket_type(s));
     match (domain, kind) {
         (Ok(rustix::net::AddressFamily::UNIX), Ok(rustix::net::SocketType::SEQPACKET)) => Ok(()),
-        _ => Err(Error::FdKind { fd, kind: fd_kind(fd).unwrap_or_default() }),
+        _ => Err(Error::FdKind { fd, kind: fd_kind(proc, fd).unwrap_or_default() }),
     }
 }
 
-/// `/proc/self` is on procfs (`PROC_SUPER_MAGIC`).
-fn proc_is_procfs() -> Result<()> {
+/// `/proc/self`, opened once: a directory on procfs (`PROC_SUPER_MAGIC`).
+fn proc_self() -> Result<OwnedFd> {
     const PROC_SUPER_MAGIC: i64 = 0x9fa0;
-    let st = rustix::fs::statfs("/proc/self").map_err(rx("/proc/self"))?;
+    let proc = rustix::fs::open("/proc/self", OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, FsMode::empty())
+        .map_err(rx("/proc/self"))?;
+    let st = rustix::fs::fstatfs(&proc).map_err(rx("/proc/self"))?;
     if st.f_type as i64 != PROC_SUPER_MAGIC {
         return Err(Error::Os { what: "/proc", source: io::Error::other(format!("not procfs (f_type {:#x})", st.f_type)) });
     }
-    Ok(())
+    Ok(proc)
+}
+
+/// `name` under `dir`, read whole.
+fn read_at(dir: &OwnedFd, name: &str) -> io::Result<String> {
+    let f = rustix::fs::openat(dir, name, OFlags::RDONLY | OFlags::CLOEXEC, FsMode::empty())?;
+    let mut s = String::new();
+    io::Read::read_to_string(&mut std::fs::File::from(f), &mut s)?;
+    Ok(s)
+}
+
+/// The numeric entries of directory `name` under `dir` (tids, pids).
+fn numbers_at(dir: &OwnedFd, name: &str) -> io::Result<Vec<i32>> {
+    let d = rustix::fs::openat(dir, name, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, FsMode::empty())?;
+    let mut out = vec![];
+    for e in rustix::fs::Dir::read_from(&d)? {
+        if let Some(n) = e?.file_name().to_str().ok().and_then(|n| n.parse::<i32>().ok()) {
+            out.push(n);
+        }
+    }
+    Ok(out)
 }
 
 /// Step 1. A thread just joined (unsharek's image builders) is still listed while it finishes
-/// exiting: a few milliseconds' grace, then the others are named.
-fn one_thread() -> Result<()> {
+/// exiting: a few milliseconds' grace, then the others are named. This thread must be listed:
+/// else `/proc` is another pid namespace's, and its `self` isn't this process.
+fn one_thread(proc: &OwnedFd) -> Result<()> {
     let me = rustix::thread::gettid().as_raw_nonzero().get();
     let mut others = vec![];
     for _ in 0..20 {
-        others = std::fs::read_dir("/proc/self/task")
-            .map_err(os("/proc/self/task"))?
-            .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<i32>().ok())
-            .filter(|&tid| tid != me)
-            .collect();
+        let tids = numbers_at(proc, "task").map_err(os("/proc/self/task"))?;
+        if !tids.contains(&me) {
+            return Err(Error::Os { what: "/proc/self/task", source: io::Error::other(format!("tid {me} not listed: another pid namespace's /proc")) });
+        }
+        others = tids.into_iter().filter(|&tid| tid != me).collect();
         if others.is_empty() {
             return Ok(());
         }
@@ -172,12 +231,75 @@ fn one_thread() -> Result<()> {
 }
 
 /// `/proc/self/fd/<fd>`'s link: what the fd is (`anon_inode:[eventfd]`, `socket:[123]`, a path).
-fn fd_kind(fd: RawFd) -> io::Result<String> {
-    let link = std::fs::read_link(format!("/proc/self/fd/{fd}"))?;
+fn fd_kind(proc: &OwnedFd, fd: RawFd) -> io::Result<String> {
+    let link = rustix::fs::readlinkat(proc, format!("fd/{fd}"), Vec::new())?;
     Ok(link.to_string_lossy().into_owned())
 }
 
-/// Step 3: `close_range` between and above `keep` (sorted, deduplicated).
+/// Step 0: the crate's "Assumptions", as far as /proc shows them. Best-effort: a process whose
+/// entries this one may not read is skipped.
+fn paranoia(proc: &OwnedFd, mode: Mode, keep: &[RawFd]) -> Result<()> {
+    let bad = |s: String| Err(Error::Paranoia(s));
+    // No tracer: it could change the memory and registers lockdown checked.
+    let status = read_at(proc, "status").map_err(os("/proc/self/status"))?;
+    if let Some(t) = status.lines().find_map(|l| l.strip_prefix("TracerPid:"))
+        && t.trim() != "0" {
+            return bad(format!("traced by pid {}", t.trim()));
+        }
+    // No kept fd of a kind no caller means to give: read and write on it would reach past the
+    // sandbox (another process's memory, the kernel's) or act asynchronously (io_uring).
+    for &fd in keep {
+        let Ok(kind) = fd_kind(proc, fd) else { continue };
+        let refused = ["anon_inode:[io_uring]", "anon_inode:[userfaultfd]", "anon_inode:[perf_event]", "anon_inode:[fanotify]", "anon_inode:seccomp notify", "anon_inode:bpf-", "/dev/mem", "/dev/kmem", "/dev/port"];
+        let proc_mem = kind.starts_with("/proc/") && kind.ends_with("/mem");
+        // A writable fd of /proc or /sys: the kernel's state (a sysctl, another process's).
+        let writable = read_at(proc, &format!("fdinfo/{fd}"))
+            .ok()
+            .and_then(|i| i.lines().find_map(|l| l.strip_prefix("flags:").map(|f| u32::from_str_radix(f.trim(), 8).unwrap_or(0))))
+            .is_some_and(|f| f & libc::O_ACCMODE as u32 != libc::O_RDONLY as u32);
+        let kernel_state = writable && (kind.starts_with("/proc/") || kind.starts_with("/sys/"));
+        if refused.iter().any(|r| kind.starts_with(r)) || proc_mem || kernel_state {
+            return bad(format!("kept fd {fd} is {kind:?}"));
+        }
+    }
+    // The other processes, by their /proc entries (`..` of /proc/self: /proc itself).
+    let me = rustix::process::getpid().as_raw_nonzero().get();
+    let root = rustix::fs::openat(proc, "..", OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, FsMode::empty()).map_err(rx("/proc"))?;
+    let pids: Vec<i32> = numbers_at(&root, ".").map_err(os("/proc"))?.into_iter().filter(|&p| p != me).collect();
+    // No other process with this address space (a `CLONE_VM` child that isn't a thread, a
+    // `vfork` parent): TSYNC doesn't reach it, and it would run unfiltered on memory the program
+    // writes. kcmp(KCMP_VM) 0 is the same mm; ENOSYS (no CONFIG_KCMP) ends the look.
+    const KCMP_VM: i32 = 1;
+    for &pid in &pids {
+        // SAFETY: kcmp compares two processes' mms; it reads nothing of ours.
+        let r = unsafe { libc::syscall(libc::SYS_kcmp, me, pid, KCMP_VM, 0, 0) };
+        if r == 0 {
+            return bad(format!("pid {pid} shares this process's memory"));
+        }
+        if r < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS) {
+            break;
+        }
+    }
+    // Fork mode: no other process maps the shared anonymous memory (by its device and inode).
+    if mode == Mode::Fork {
+        let maps = read_at(proc, "maps").map_err(os("/proc/self/maps"))?;
+        let shared: Vec<String> = maps.lines().filter(|l| l.contains(" rw-s ") && l.ends_with("/dev/zero (deleted)")).filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            (f.len() >= 5).then(|| format!(" {} {} ", f[3], f[4]))
+        }).collect();
+        if !shared.is_empty() {
+            for &pid in &pids {
+                let Ok(theirs) = read_at(&root, &format!("{pid}/maps")) else { continue };
+                if let Some(l) = theirs.lines().find(|l| shared.iter().any(|k| l.contains(k.as_str()))) {
+                    return bad(format!("pid {pid} maps this process's shared memory: {l}"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Step 4: `close_range` between and above `keep` (sorted, deduplicated).
 fn close_except(keep: &[RawFd]) -> Result<()> {
     let close = |lo: u32, hi: u32| {
         // SAFETY: closes fds of this process; the kept ones are outside the range.
@@ -194,7 +316,7 @@ fn close_except(keep: &[RawFd]) -> Result<()> {
     close(next, u32::MAX)
 }
 
-/// Step 4: every line of `/proc/self/maps` is one of
+/// Step 3: every line of `/proc/self/maps` is one of
 /// - private (`p`): the process's own copy, whatever it was mapped from (a file's bytes are
 ///   disclosed, never written back);
 /// - shared and not writable: the file's bytes, read (and `mprotect`, which could make it
@@ -205,19 +327,29 @@ fn close_except(keep: &[RawFd]) -> Result<()> {
 /// Anything else is refused: above all a writable shared mapping of a host file (or of a memfd,
 /// `/memfd:…`, or SysV shm, or a device), through which the program could write what the host
 /// reads.
-fn check_maps(mode: Mode) -> Result<()> {
-    let maps = std::fs::read_to_string("/proc/self/maps").map_err(os("/proc/self/maps"))?;
+fn check_maps(proc: &OwnedFd, mode: Mode) -> Result<()> {
+    let maps = read_at(proc, "maps").map_err(os("/proc/self/maps"))?;
+    let shm = shm_dev()?;
     for line in maps.lines() {
-        if !map_ok(line, mode) {
+        if !map_ok(line, mode, &shm) {
             return Err(Error::Mapping(line.to_owned()));
         }
     }
     Ok(())
 }
 
+/// The kernel's shmem device, as /proc/self/maps writes it (`00:01`): a memfd's, which is on the
+/// same internal mount as `MAP_SHARED | MAP_ANONYMOUS` memory. A tmpfs file named `/dev/zero`,
+/// deleted, has the same path and a `00:` device too, but not this one.
+fn shm_dev() -> Result<String> {
+    let fd = rustix::fs::memfd_create("unsharek-tcb", rustix::fs::MemfdFlags::CLOEXEC).map_err(rx("memfd_create"))?;
+    let st = rustix::fs::fstat(&fd).map_err(rx("memfd fstat"))?;
+    Ok(format!("{:02x}:{:02x}", rustix::fs::major(st.st_dev), rustix::fs::minor(st.st_dev)))
+}
+
 /// One `/proc/self/maps` line (`lo-hi perms offset dev inode [path]`), judged as [`check_maps`]
-/// says.
-pub fn map_ok(line: &str, mode: Mode) -> bool {
+/// says; `shm` the shmem device ([`shm_dev`]).
+pub fn map_ok(line: &str, mode: Mode, shm: &str) -> bool {
     let mut f = line.splitn(6, ' ');
     let (Some(_range), Some(perms), Some(_off), Some(dev), Some(_inode)) = (f.next(), f.next(), f.next(), f.next(), f.next())
     else {
@@ -231,7 +363,7 @@ pub fn map_ok(line: &str, mode: Mode) -> bool {
     match (p[1], p[3]) {
         (_, b'p') => true,
         (b'-', b's') => true,
-        (b'w', b's') => mode == Mode::Fork && path == "/dev/zero (deleted)" && dev.starts_with("00:"),
+        (b'w', b's') => mode == Mode::Fork && path == "/dev/zero (deleted)" && dev == shm,
         _ => false,
     }
 }

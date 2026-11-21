@@ -16,7 +16,6 @@ Access is enforced by seccomp, with three configurations, one per mode ([`policy
 |---|---|---|
 | `read`, `write` | any fd: only granted ones are open, and nothing can open more (as each fd's own mode allows) | all |
 | `ppoll` | at most 8 fds, no signal mask (readiness only: moves no data) | all |
-| `kill` | the sandbox's own pid, a signal number (ends it as a native death by that signal would) | all |
 | `exit_group`, `rt_sigreturn` | always | all |
 | `clone` | exactly a host thread's flags | threaded, fork |
 | `exit` | status 0 (a host thread's end) | threaded, fork |

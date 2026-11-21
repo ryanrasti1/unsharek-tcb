@@ -5,7 +5,7 @@
 
 use std::os::fd::RawFd;
 
-use unsharek_tcb::{Config, Error, Mode};
+use unsharek_tcb::{Config, Error, Fds, Mode};
 
 /// The test's gate: `nr(a0, a1, a2)`, raw result.
 #[unsafe(naked)]
@@ -39,7 +39,7 @@ struct Guest {
 }
 
 
-fn lockdown(guest: &Guest, grants: impl FnOnce(&mut Config)) -> unsharek_tcb::Result<()> {
+fn lockdown(guest: &Guest, grants: impl FnOnce(&mut Config)) -> unsharek_tcb::Result<Fds> {
     let mut c = Config::new().mode(guest.mode).guest_fds(guest.fds.iter().copied()).gate(&raw const unsharek_tcb_ctl_gate_ret as u64);
     grants(&mut c);
     unsharek_tcb::lockdown(c)
@@ -137,14 +137,14 @@ fn control_socket_receives_fds() {
             assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
             send_fd(provider, pipe[1]);
             let guest = Guest { fds: vec![eventfd()], mode };
-            if lockdown(&guest, |s| {
+            let Ok(f) = lockdown(&guest, |s| {
                 s.recv_fds = Some(ctl);
                 s.fds.extend([pipe[0]]);
-            })
-            .is_err()
-            {
+            }) else {
                 return 1;
-            }
+            };
+            // The kept fds' new numbers.
+            let (ctl, pipe) = (f.get(ctl).unwrap(), [f.get(pipe[0]).unwrap(), -1]);
             let fd = gate_recv_fd(ctl, libc::MSG_CMSG_CLOEXEC);
             if fd < 0 {
                 return 2;
@@ -172,14 +172,13 @@ fn control_socket_refusals_kill() {
             let [ctl, _provider] = socketpair(libc::SOCK_SEQPACKET);
             let [other, _o] = socketpair(libc::SOCK_SEQPACKET);
             let guest = Guest { fds: vec![eventfd()], mode: Mode::Coroutine };
-            if lockdown(&guest, |s| {
+            let Ok(f) = lockdown(&guest, |s| {
                 s.recv_fds = Some(ctl);
                 s.fds.extend([other]);
-            })
-            .is_err()
-            {
+            }) else {
                 return 1;
-            }
+            };
+            let (ctl, other) = (f.get(ctl).unwrap(), f.get(other).unwrap());
             match case {
                 0 => gate_recv_fd(other, libc::MSG_CMSG_CLOEXEC),
                 1 => gate_recv_fd(ctl, 0),
@@ -208,7 +207,7 @@ fn refuses_a_control_socket_of_the_wrong_kind() {
             match lockdown(&guest, |s| s.recv_fds = Some(fd)) {
                 Err(Error::FdKind { .. }) => 0,
                 Err(_) => 1,
-                Ok(()) => 2,
+                Ok(_) => 2,
             }
         }));
         assert_eq!(code, 0, "{kind}");
@@ -225,17 +224,18 @@ fn close_received_only() {
         let mut pipe = [0; 2];
         // SAFETY: pipe into a local.
         assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
-        // A hole below the kept fds: lockdown must fill it, not leave it to recvmsg.
+        // A hole below the kept fds: lockdown must close it (renumbering), not leave it to recvmsg.
         // SAFETY: closing our own fd.
         unsafe { libc::close(pipe[0]) };
         send_fd(provider, pipe[1]);
         send_fd(provider, pipe[1]);
         let guest = Guest { fds: vec![eventfd()], mode: Mode::Coroutine };
-        if lockdown(&guest, |s| s.recv_fds = Some(ctl)).is_err() {
+        let Ok(f) = lockdown(&guest, |s| s.recv_fds = Some(ctl)) else {
             return 1;
-        }
+        };
+        let ctl = f.get(ctl).unwrap();
         let a = gate_recv_fd(ctl, libc::MSG_CMSG_CLOEXEC);
-        if a <= ctl as isize {
+        if a < f.n as isize {
             return 2;
         }
         if g(libc::SYS_close, [a as usize, 0, 0]) != 0 {
@@ -261,10 +261,10 @@ fn close_received_only() {
                     s.fds.extend([ctl]);
                 }
             });
-            if r.is_err() {
+            let Ok(f) = r else {
                 return 1;
-            }
-            let fd = [1, ctl, efd, ctl][which];
+            };
+            let fd = f.get([1, ctl, efd, ctl][which]).unwrap();
             g(libc::SYS_close, [fd as usize, 0, 0]);
             2
         });

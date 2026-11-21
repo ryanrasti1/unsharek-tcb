@@ -6,7 +6,8 @@
 use unsharek_tcb::{AUDIT_ARCH_X86_64, Mode, PPOLL_FDS, RET_ALLOW, filter, policy, seccomp_data, sock_filter};
 
 const GATE: u64 = 0x0000_7f12_3456_7890;
-const PID: u32 = 4242;
+/// The fd floor the tests use: kept fds 0..N.
+const N: u64 = 9;
 const MODES: [Mode; 3] = [Mode::Coroutine, Mode::Threaded, Mode::Fork];
 
 const READ: u32 = libc::SYS_read as u32;
@@ -14,16 +15,15 @@ const WRITE: u32 = libc::SYS_write as u32;
 const RT_SIGRETURN: u32 = libc::SYS_rt_sigreturn as u32;
 const CLONE: u32 = libc::SYS_clone as u32;
 const EXIT: u32 = libc::SYS_exit as u32;
-const KILL: u32 = libc::SYS_kill as u32;
 const EXIT_GROUP: u32 = libc::SYS_exit_group as u32;
 const PPOLL: u32 = libc::SYS_ppoll as u32;
 
 #[test]
 fn filter_is_the_policy() {
     for mode in MODES {
-        for (pid, ppoll_max, gate) in [(PID, PPOLL_FDS, GATE), (1, 0, 0), (u32::MAX, 3, u64::MAX), (7, u64::MAX, 1 << 32)] {
-            seccomp_fn_verify::check_sampled(policy, filter, (mode, pid as u64, ppoll_max, gate, None), 5_000);
-            seccomp_fn_verify::check_sampled(policy, filter, (mode, pid as u64, ppoll_max, gate, Some((7, 9))), 5_000);
+        for (n, ppoll_max, gate) in [(N, PPOLL_FDS, GATE), (0, 0, 0), (u64::MAX, 3, u64::MAX), (3, u64::MAX, 1 << 32)] {
+            seccomp_fn_verify::check_sampled(policy, filter, (mode, n, ppoll_max, gate, None), 5_000);
+            seccomp_fn_verify::check_sampled(policy, filter, (mode, n, ppoll_max, gate, Some(7)), 5_000);
         }
     }
 }
@@ -31,15 +31,15 @@ fn filter_is_the_policy() {
 /// The numbers [`policy`] allows in `mode`, for some arguments: every x86-64 number, each tried
 /// with the arguments the program compares with (its jumps' constants: all fit 32 bits).
 fn ruled(mode: Mode) -> std::collections::BTreeSet<u32> {
-    let prog = filter(mode, PID as u64, PPOLL_FDS, GATE, None);
+    let prog = filter(mode, N, PPOLL_FDS, GATE, None);
     let k: Vec<u64> = prog.iter().filter(|i| i.code & 0x07 == 0x05).map(|i| i.k as u64).chain([0, 1]).collect();
     let mut out = std::collections::BTreeSet::new();
     for nr in 0..1024u32 {
         for &a0 in &k {
             for &a1 in &k {
                 let d = seccomp_data { nr: nr as i32, arch: AUDIT_ARCH_X86_64, instruction_pointer: GATE, args: [a0, a1, 0, 0, 0, 0] };
-                if policy(mode, PID as u64, PPOLL_FDS, GATE, None)(&d) == RET_ALLOW {
-                    out.insert(nr as u32);
+                if policy(mode, N, PPOLL_FDS, GATE, None)(&d) == RET_ALLOW {
+                    out.insert(nr);
                 }
             }
         }
@@ -54,7 +54,7 @@ fn program_rows(mode: Mode) -> Vec<Vec<u32>> {
     let ld_nr = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
     let jeq = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
     let off_nr = std::mem::offset_of!(libc::seccomp_data, nr) as u32;
-    let prog: Vec<sock_filter> = filter(mode, PID as u64, PPOLL_FDS, GATE, None);
+    let prog: Vec<sock_filter> = filter(mode, N, PPOLL_FDS, GATE, None);
     let mut out: Vec<Vec<u32>> = vec![];
     let mut in_row = false;
     for i in &prog {
@@ -84,7 +84,6 @@ fn readme_table_is_the_policy() {
             "read" => READ,
             "write" => WRITE,
             "ppoll" => PPOLL,
-            "kill" => KILL,
             "exit_group" => EXIT_GROUP,
             "rt_sigreturn" => RT_SIGRETURN,
             "clone" => CLONE,
@@ -119,14 +118,14 @@ fn readme_table_is_the_policy() {
         assert_eq!(table, ruled(mode), "{mode:?}: README.md's table against the policy");
         assert_eq!(ordered, program_rows(mode), "{mode:?}: README.md's rows against the policy's, in order");
     }
-    assert_eq!(rows, 9, "README.md's allowlist tables: their rows (7 core, 2 plugin)");
+    assert_eq!(rows, 8, "README.md's allowlist tables: their rows (6 core, 2 plugin)");
 }
 
 /// The program's length in each mode.
 #[test]
 fn filter_length() {
     for mode in MODES {
-        let n = filter(mode, PID as u64, PPOLL_FDS, GATE, None).len();
+        let n = filter(mode, N, PPOLL_FDS, GATE, None).len();
         eprintln!("{mode:?}: {n} instructions");
         assert!(n <= 128, "{mode:?}: {n} instructions");
     }
@@ -146,8 +145,8 @@ fn recvmsg_only_on_the_control_socket() {
         args: [fd, 0x1000, flags, 0, 0, 0],
     };
     for mode in MODES {
-        let with = |d: &seccomp_data| policy(mode, PID as u64, PPOLL_FDS, GATE, Some((7, 9)))(d);
-        let without = |d: &seccomp_data| policy(mode, PID as u64, PPOLL_FDS, GATE, None)(d);
+        let with = |d: &seccomp_data| policy(mode, N, PPOLL_FDS, GATE, Some(7))(d);
+        let without = |d: &seccomp_data| policy(mode, N, PPOLL_FDS, GATE, None)(d);
         assert_eq!(with(&call(recvmsg, 7, cloexec)), RET_ALLOW, "{mode:?}");
         assert_ne!(with(&call(recvmsg, 8, cloexec)), RET_ALLOW, "{mode:?}: another fd");
         assert_ne!(with(&call(recvmsg, 7, 0)), RET_ALLOW, "{mode:?}: without MSG_CMSG_CLOEXEC");
@@ -158,14 +157,43 @@ fn recvmsg_only_on_the_control_socket() {
     }
 }
 
+/// `read` and `write` on a kept fd (below the floor) only, as an int; with the plugin on a
+/// received one too (at or above it), never with a high bit set. `kill` never: a death by a
+/// signal is the runtime's exit_group(128 + n).
+#[test]
+fn read_write_below_the_floor() {
+    let call = |nr: i64, fd: u64| seccomp_data { nr: nr as i32, arch: AUDIT_ARCH_X86_64, instruction_pointer: GATE, args: [fd, 0, 0, 0, 0, 0] };
+    for mode in MODES {
+        let without = |d: &seccomp_data| policy(mode, N, PPOLL_FDS, GATE, None)(d);
+        let with = |d: &seccomp_data| policy(mode, N, PPOLL_FDS, GATE, Some(7))(d);
+        for nr in [libc::SYS_read, libc::SYS_write] {
+            for fd in [0, 1, 2, N - 1] {
+                assert_eq!(without(&call(nr, fd)), RET_ALLOW, "{mode:?} {nr} {fd}");
+            }
+            for fd in [N, N + 1, 1000, (1 << 32) | 1, u64::MAX] {
+                assert_ne!(without(&call(nr, fd)), RET_ALLOW, "{mode:?} {nr} {fd:#x}");
+            }
+            assert_eq!(with(&call(nr, 1000)), RET_ALLOW, "{mode:?}: a received fd");
+            for fd in [1u64 << 31, (1 << 32) | 1, u64::MAX] {
+                assert_ne!(with(&call(nr, fd)), RET_ALLOW, "{mode:?} {nr} {fd:#x}");
+            }
+        }
+        // Floor 0: nothing kept, nothing readable.
+        assert_ne!(policy(mode, 0, PPOLL_FDS, GATE, None)(&call(libc::SYS_read, 0)), RET_ALLOW);
+        let kill = seccomp_data { nr: libc::SYS_kill as i32, arch: AUDIT_ARCH_X86_64, instruction_pointer: GATE, args: [4242, 9, 0, 0, 0, 0] };
+        assert_ne!(without(&kill), RET_ALLOW, "{mode:?}: kill");
+        assert_ne!(with(&kill), RET_ALLOW, "{mode:?}: kill");
+    }
+}
+
 /// Plugin: capnweb. `close` only at or above the floor, as an int, only with a control socket.
 #[test]
 fn close_only_above_the_floor() {
     let close = |fd: u64| seccomp_data { nr: libc::SYS_close as i32, arch: AUDIT_ARCH_X86_64, instruction_pointer: GATE, args: [fd, 0, 0, 0, 0, 0] };
     for mode in MODES {
-        let with = |d: &seccomp_data| policy(mode, PID as u64, PPOLL_FDS, GATE, Some((7, 9)))(d);
-        let without = |d: &seccomp_data| policy(mode, PID as u64, PPOLL_FDS, GATE, None)(d);
-        assert_eq!(with(&close(9)), RET_ALLOW, "{mode:?}");
+        let with = |d: &seccomp_data| policy(mode, N, PPOLL_FDS, GATE, Some(7))(d);
+        let without = |d: &seccomp_data| policy(mode, N, PPOLL_FDS, GATE, None)(d);
+        assert_eq!(with(&close(N)), RET_ALLOW, "{mode:?}");
         assert_eq!(with(&close(1000)), RET_ALLOW, "{mode:?}");
         for fd in [0, 1, 2, 7, 8, 1 << 31, (1 << 32) | 1, u64::MAX] {
             assert_ne!(with(&close(fd)), RET_ALLOW, "{mode:?}: close({fd:#x})");

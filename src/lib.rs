@@ -17,7 +17,8 @@
 //!     .grant([0, 1, 2])      // kept, read and write only
 //!     .guest_fds([token_fd]) // the guest's own: kind-checked
 //!     .gate(gate);           // the one instruction host calls may come from
-//! lockdown(c)?;
+//! let fds = lockdown(c)?;    // the kept fds, renumbered 0..n
+//! let token_fd = fds.get(token_fd).unwrap();
 //! // Locked down: run the program.
 //! # Ok::<(), unsharek_tcb::Error>(())
 //! ```
@@ -31,6 +32,25 @@
 //! **Not here.** Process limits (`RLIMIT_NPROC`, cgroups) are the caller's to set, before
 //! lockdown or from outside: the runtime's own limits (unsharek's `max_procs`) run in the program's
 //! address space and a compromised program can bypass them.
+//!
+//! **Assumptions.** Lockdown checks what it can of the process it leaves behind; these it takes
+//! as given, from the caller (code before lockdown is trusted):
+//! - **one thread**, the caller's, at lockdown (checked: `/proc/self/task`), and no other process
+//!   sharing the address space (a `CLONE_VM` child that isn't a thread, or a `vfork` parent:
+//!   seccomp's TSYNC doesn't reach it; the paranoia check looks, below);
+//! - **mappings persist** as checked: no allowed call makes, changes or removes one, and nothing
+//!   outside changes them (no tracer: the paranoia check looks; after lockdown the process isn't
+//!   dumpable, so the host's same user can't attach);
+//! - **no shared anonymous memory from elsewhere**: fork mode's `MAP_SHARED | MAP_ANONYMOUS`
+//!   memory is the sandbox's own, not inherited from a host process (the paranoia check looks
+//!   for another process mapping the same memory);
+//! - **no unknown fds**: each granted fd is what the caller means to give (read and write on it
+//!   are the program's); lockdown checks only that it is open (the paranoia check refuses some
+//!   kinds that can't be meant: another process's memory, io_uring, userfaultfd, …).
+//!
+//! **Paranoia** ([`Config::paranoia`], on by default) is a best-effort check of those
+//! assumptions, before the rest: it reads every process's `/proc` entries it may, so it costs
+//! time in proportion to the host's processes ([`paranoia_ns`]).
 //!
 //! **Disclosure.** Lockdown leaves the address space as it is: everything in memory at lockdown
 //! (the caller's heap, its stack, its static data) is readable by the program. Hold no secret in
@@ -48,12 +68,12 @@ pub use filter::{
 };
 pub use libc::{seccomp_data, sock_filter};
 #[doc(hidden)]
-pub use lockdown::{check_ns, map_ok};
+pub use lockdown::{check_ns, map_ok, paranoia_ns};
 
 /// How the guest runs the program's threads and processes. Each mode's allowlist is a superset of
 /// the one before.
+// (not `kani::Arbitrary`: the proof lists its values, `policy!(…, Mode = [coroutine: …])`)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[cfg_attr(kani, derive(kani::Arbitrary))]
 pub enum Mode {
     /// One host thread.
     #[default]
@@ -90,11 +110,13 @@ pub struct Config {
     pub ppoll_max: u64,
     /// Plugin: capnweb (experimental). The control socket ([`Config::recv_fds`]).
     pub recv_fds: Option<RawFd>,
+    /// The best-effort check of lockdown's assumptions ([`Config::paranoia`]). On by default.
+    pub paranoia: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { mode: Mode::default(), fds: vec![], guest_fds: vec![], gate: None, ppoll_max: PPOLL_FDS, recv_fds: None }
+        Config { mode: Mode::default(), fds: vec![], guest_fds: vec![], gate: None, ppoll_max: PPOLL_FDS, recv_fds: None, paranoia: true }
     }
 }
 
@@ -111,7 +133,8 @@ impl Config {
     }
 
     /// Keep `fds` open past lockdown; every other fd is closed. Fds 0-2 are granted like any other
-    /// (none is by default). Lockdown checks each is open. What may be done on one is `read` and
+    /// (none is by default). Lockdown checks each is open, and renumbers the kept fds `0..n`
+    /// ([`Fds`]: a kept fd already below `n`, as 0-2 when granted, keeps its number). What may be done on one is `read` and
     /// `write`, as its own mode allows (an `O_RDONLY` file can't be written; a pipe end is one-way),
     /// and nothing else (no `ioctl`, no `sendmsg`, no `close`). A two-way fd the program should only
     /// write (a terminal as stdout) is the caller's to reopen one-way first.
@@ -136,11 +159,21 @@ impl Config {
         self
     }
 
-    /// Plugin: capnweb (experimental). A control socket, kept like a grant, on which the process
-    /// may `recvmsg` (`MSG_CMSG_CLOEXEC`) the fds the provider's process sends, and `close` those
-    /// fds: lockdown checks it is a unix `SOCK_SEQPACKET` socket.
+    /// Plugin: capnweb (experimental). A control socket, kept like a grant (renumbered with
+    /// them), on which the process may `recvmsg` (`MSG_CMSG_CLOEXEC`) the fds the provider's
+    /// process sends, and `close` those fds (at or above the floor `n`, where only they land):
+    /// lockdown checks it is a unix `SOCK_SEQPACKET` socket.
     pub fn recv_fds(mut self, ctl: RawFd) -> Self {
         self.recv_fds = Some(ctl);
+        self
+    }
+
+    /// Whether lockdown first checks its assumptions, best-effort (the crate's "Assumptions":
+    /// another process sharing the memory, a tracer, shared memory another process maps, a
+    /// grant of a kind that can't be meant). On by default; off saves its time
+    /// ([`paranoia_ns`]), not a guarantee.
+    pub fn paranoia(mut self, on: bool) -> Self {
+        self.paranoia = on;
         self
     }
 
@@ -165,6 +198,8 @@ pub enum Error {
     /// A mapping lockdown refuses (its `/proc/self/maps` line): writable and shared with something
     /// outside the sandbox.
     Mapping(String),
+    /// The paranoia check ([`Config::paranoia`]) found an assumption broken.
+    Paranoia(String),
     /// A capability lockdown couldn't drop.
     Capabilities(String),
     /// The filter is longer than the kernel takes.
@@ -188,6 +223,7 @@ impl fmt::Display for Error {
                 write!(f, "the guest's fd {fd} is {kind:?}, not an eventfd or a pidfd")
             }
             Error::Mapping(line) => write!(f, "a mapping shared with the host, writable: {line}"),
+            Error::Paranoia(what) => write!(f, "paranoia: {what}"),
             Error::Capabilities(what) => write!(f, "capabilities: {what}"),
             Error::Filter(e) => write!(f, "the filter: {e}"),
             Error::Os { what, source } => write!(f, "{what}: {source}"),
@@ -199,29 +235,54 @@ impl std::error::Error for Error {}
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// The kept fds after lockdown: the grants and the guest's own, renumbered `0..n` in place. A
+/// kept fd below `n` keeps its number (0-2, when granted); each one at or above it moves to a
+/// free number below (lowest first, in order of the old numbers), close-on-exec as it was. So
+/// the filter's `fd < n` is exactly the kept fds, whatever numbers they had (no placeholder
+/// fills a gap, and a huge fd costs nothing).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fds {
+    /// The floor: the number of kept fds.
+    pub n: RawFd,
+    /// (old, new) for every kept fd, sorted by the old number.
+    pub map: Vec<(RawFd, RawFd)>,
+}
+
+impl Fds {
+    /// The new number of kept fd `old`; `None` if it wasn't kept.
+    pub fn get(&self, old: RawFd) -> Option<RawFd> {
+        self.map.binary_search_by_key(&old, |&(o, _)| o).ok().map(|i| self.map[i].1)
+    }
+}
+
 /// Lock the process down with `config`, and nothing else. In this order:
 ///
-/// 1. exactly one thread, the caller's (`/proc/self/task`; a thread just joined gets a few ms
-///    to vanish). Every check after this one can't be raced;
+/// 0. with [`Config::paranoia`], its assumptions checked (the crate's "Assumptions");
+/// 1. exactly one thread, the caller's (`/proc/self/task`, read through one fd of `/proc/self`,
+///    checked to be procfs; a thread just joined gets a few ms to vanish). Every check after
+///    this one can't be raced;
 /// 2. the guest's own fds ([`Config::guest_fds`]) kind-checked: eventfds, and pidfds in fork
 ///    mode only; every granted fd open;
 /// 3. every mapping kind-checked (`/proc/self/maps`): private, or shared and read-only, or (in
-///    fork mode) shared anonymous memory; above all no writable shared mapping of a host file;
-/// 4. every fd neither granted nor the guest's closed (not refused: a CLI inherits stray fds);
+///    fork mode) shared anonymous memory (the kernel's shmem); above all no writable shared
+///    mapping of a host file;
+/// 4. every fd neither granted nor the guest's closed (not refused: a CLI inherits stray fds),
+///    and the kept ones renumbered `0..n` ([`Fds`]);
 /// 5. no core dump (`RLIMIT_CORE` 0) and not dumpable (`PR_SET_DUMPABLE` 0): a crash makes the
 ///    host write none of the process's memory, nor start `core_pattern`'s helper;
 /// 6. every capability dropped (bounding where permitted, ambient, effective, permitted,
 ///    inheritable);
 /// 7. `no_new_privs`;
-/// 8. the filter ([`filter`]), with TSYNC (redundant after step 1, kept).
+/// 8. the filter ([`filter`], its floor `n`), with TSYNC (redundant after step 1, kept).
 ///
 /// A caller that wants more restrictions installs its own seccomp filter before this: filters
 /// stack, the strictest answer wins (it must let lockdown's own calls through).
 ///
-/// On success the process is locked down ([`locked_down`]) and the caller hands over to the
-/// program. On failure nothing untrusted has run.
-pub fn lockdown(config: Config) -> Result<()> {
-    lockdown::lockdown(config)?;
+/// On success the process is locked down ([`locked_down`]); the caller uses the kept fds' new
+/// numbers ([`Fds::get`]) and hands over to the program. On failure nothing untrusted has run
+/// (the fds may have been renumbered already: the caller reports the error and ends).
+pub fn lockdown(config: Config) -> Result<Fds> {
+    let fds = lockdown::lockdown(config)?;
     LOCKED.store(true, std::sync::atomic::Ordering::SeqCst);
-    Ok(())
+    Ok(fds)
 }
