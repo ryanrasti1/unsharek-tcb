@@ -10,26 +10,23 @@
 //! pinned. Every other syscall traps (SIGSYS, served by the guest).
 //!
 //! ```no_run
-//! use unsharek_tcb::{Config, Confined, Mode};
-//! # struct Guest;
-//! # impl Confined for Guest {
-//! #     fn host_fds(&self) -> Vec<std::os::fd::RawFd> { vec![] }
-//! #     fn gate_ip(&self) -> u64 { 0 }
-//! #     fn mode(&self) -> Mode { Mode::Coroutine }
-//! # }
-//! # static GUEST: Guest = Guest;
-//! unsharek_tcb::register(&GUEST); // the guest, once (unsharek's Guest::boot does it)
-//! let mut c = Config::default();
-//! c.grant(0).grant(1).grant(2);
-//! unsharek_tcb::lockdown(c)?;
+//! use unsharek_tcb::{Config, Mode, lockdown};
+//! # let (gate, token_fd) = (0u64, 3);
+//! let c = Config::new()
+//!     .mode(Mode::Threaded)
+//!     .grant([0, 1, 2])      // kept, read and write only
+//!     .guest_fds([token_fd]) // the guest's own: kind-checked
+//!     .gate(gate);           // the one instruction host calls may come from
+//! lockdown(c)?;
 //! // Locked down: run the program.
 //! # Ok::<(), unsharek_tcb::Error>(())
 //! ```
 //!
+//! Lockdown uses the config and nothing else: it calls no code of the caller's. Whatever the guest
+//! must do first (making its fds, say) is the caller's, before it.
+//!
 //! **Templates.** A template process forks before lockdown, once per instance; each child makes
-//! its own grants (its own connection's fd, say) and calls [`lockdown`]. The child is a copy of
-//! the template, the guest's fds included: a guest whose fds must be its own per instance
-//! (unsharek's CPU tokens) makes them in [`Confined::before_lockdown`], in the child.
+//! its own config (its own connection's fd, its own guest fds) and calls [`lockdown`].
 //!
 //! **Not here.** Process limits (`RLIMIT_NPROC`, cgroups) are the caller's to set, before
 //! lockdown or from outside: the runtime's own limits (unsharek's `max_procs`) run in the program's
@@ -69,98 +66,87 @@ pub enum Mode {
     Fork,
 }
 
-/// The guest whose program runs after lockdown: what lockdown asks of it ([`register`]). Nothing it
-/// says is trusted to widen the filter: its fds are checked for kind, the gate's address only sends
-/// other calls back as TRAP, and its grants are read and write only, as the caller's are.
-pub trait Confined {
-    /// The guest's own host fds, kept past lockdown, read and write: its CPU tokens' eventfds
-    /// (`anon_inode:[eventfd]`) and, in fork mode, init's pidfd (`anon_inode:[pidfd]`). Lockdown
-    /// refuses any other kind (a pidfd in another mode too). Asked after
-    /// [`Confined::before_lockdown`].
-    fn host_fds(&self) -> Vec<RawFd>;
-    /// The address just past the gate's `syscall` instruction: the one place host calls are
-    /// allowed from. Needn't be trusted: the gate check's verdicts are TRAP and KILL only.
-    fn gate_ip(&self) -> u64;
-    /// The guest's mode: the filter's allowlist ([`Config::mode`] is used without a guest).
-    fn mode(&self) -> Mode;
-    /// Fds the guest itself needs kept (unsharek's passed and held fds): granted as
-    /// [`Config::grant`] grants, read and write, nothing more.
-    fn grants(&self) -> Vec<RawFd> {
-        vec![]
-    }
-    /// The guest's own preparation, which [`lockdown`] runs first (making its host fds, say). Code
-    /// before lockdown, and the guest's, not this crate's: like everything before lockdown it runs
-    /// with the host's authority, and lockdown checks only what it leaves behind.
-    fn before_lockdown(&self) -> Result<()> {
-        Ok(())
-    }
-}
-
-thread_local! {
-    /// The registered guest ([`register`]): one per process, on the thread that locks down.
-    static GUEST: std::cell::Cell<Option<&'static dyn Confined>> = const { std::cell::Cell::new(None) };
-}
-
 /// The process locked down ([`lockdown`] succeeded).
 static LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Register the guest that [`lockdown`] confines, on the thread that will call it (unsharek's
-/// `Guest::boot` does). Replaces an earlier one.
-pub fn register(guest: &'static dyn Confined) {
-    GUEST.with(|g| g.set(Some(guest)));
-}
 
 /// Whether [`lockdown`] has succeeded in this process.
 pub fn locked_down() -> bool {
     LOCKED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// No guest registered: no fds of its own, no gate (every call traps), the config's mode.
-struct NoGuest(Mode);
-
-impl Confined for NoGuest {
-    fn host_fds(&self) -> Vec<RawFd> {
-        vec![]
-    }
-    fn gate_ip(&self) -> u64 {
-        0
-    }
-    fn mode(&self) -> Mode {
-        self.0
-    }
-}
-
-/// The sandbox: everything the filter is made from ([`filter`]), and the grants: [`lockdown`]'s
-/// argument.
+/// Everything lockdown checks and enforces, and nothing else: [`lockdown`]'s only input. Built with
+/// [`Config::new`] and the methods below; each says what lockdown does with it.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Which allowlist, without a registered guest (with one: [`Confined::mode`]).
+    /// Which allowlist the filter has ([`Config::mode`]).
     pub mode: Mode,
-    /// The fds kept open past lockdown; every other one is closed. Fds 0-2 are granted like any
-    /// other (none is by default). What may be done on one is `read` and `write`, as its own mode
-    /// allows (an `O_RDONLY` file can't be written; a pipe end is one-way), and nothing else (no
-    /// `ioctl`, no `sendmsg`, no `close`). A two-way fd the program should only write (a terminal
-    /// as stdout) is the caller's to reopen one-way first.
+    /// The fds kept open past lockdown, read and write ([`Config::grant`]).
     pub fds: Vec<RawFd>,
+    /// The guest's own host fds, kept, kind-checked ([`Config::guest_fds`]).
+    pub guest_fds: Vec<RawFd>,
+    /// The address just past the gate's `syscall` ([`Config::gate`]). Required.
+    pub gate: Option<u64>,
     /// The most pollfds one `ppoll` may pass: at least what the guest waits on at once.
     pub ppoll_max: u64,
-    /// Plugin: capnweb (experimental). A control socket, kept like a grant, on which the process
-    /// may `recvmsg` (`MSG_CMSG_CLOEXEC`) the fds the provider's process sends: lockdown checks it
-    /// is a unix `SOCK_SEQPACKET` socket. None: no `recvmsg`.
+    /// Plugin: capnweb (experimental). The control socket ([`Config::recv_fds`]).
     pub recv_fds: Option<RawFd>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { mode: Mode::default(), fds: vec![], ppoll_max: PPOLL_FDS, recv_fds: None }
+        Config { mode: Mode::default(), fds: vec![], guest_fds: vec![], gate: None, ppoll_max: PPOLL_FDS, recv_fds: None }
     }
 }
 
 impl Config {
-    /// Keep host fd `fd` open past lockdown ([`Config::fds`]).
-    pub fn grant(&mut self, fd: RawFd) -> &mut Self {
-        self.fds.push(fd);
+    /// Nothing granted, coroutine mode, no gate yet.
+    pub fn new() -> Self {
+        Config::default()
+    }
+
+    /// The filter's allowlist: each mode's is a superset of the one before.
+    pub fn mode(mut self, mode: Mode) -> Self {
+        self.mode = mode;
         self
+    }
+
+    /// Keep `fds` open past lockdown; every other fd is closed. Fds 0-2 are granted like any other
+    /// (none is by default). Lockdown checks each is open. What may be done on one is `read` and
+    /// `write`, as its own mode allows (an `O_RDONLY` file can't be written; a pipe end is one-way),
+    /// and nothing else (no `ioctl`, no `sendmsg`, no `close`). A two-way fd the program should only
+    /// write (a terminal as stdout) is the caller's to reopen one-way first.
+    pub fn grant(mut self, fds: impl IntoIterator<Item = RawFd>) -> Self {
+        self.fds.extend(fds);
+        self
+    }
+
+    /// The guest's own host fds, kept past lockdown, read and write: its CPU tokens' eventfds
+    /// (`anon_inode:[eventfd]`) and, in fork mode, init's pidfd (`anon_inode:[pidfd]`). Lockdown
+    /// refuses any other kind (a pidfd in another mode too).
+    pub fn guest_fds(mut self, fds: impl IntoIterator<Item = RawFd>) -> Self {
+        self.guest_fds.extend(fds);
+        self
+    }
+
+    /// The address just past the gate's `syscall` instruction: the one place host calls are allowed
+    /// from. Needn't be trusted: the gate check's verdicts are TRAP and KILL only. Required: without
+    /// it every call would trap, the process's own exit too.
+    pub fn gate(mut self, ip: u64) -> Self {
+        self.gate = Some(ip);
+        self
+    }
+
+    /// Plugin: capnweb (experimental). A control socket, kept like a grant, on which the process
+    /// may `recvmsg` (`MSG_CMSG_CLOEXEC`) the fds the provider's process sends, and `close` those
+    /// fds: lockdown checks it is a unix `SOCK_SEQPACKET` socket.
+    pub fn recv_fds(mut self, ctl: RawFd) -> Self {
+        self.recv_fds = Some(ctl);
+        self
+    }
+
+    /// `f(self)`: a step of the caller's in the chain (`.pipe(|c| guest.configure_sandbox(c))?`).
+    pub fn pipe<T>(self, f: impl FnOnce(Self) -> T) -> T {
+        f(self)
     }
 }
 
@@ -168,8 +154,8 @@ impl Config {
 /// failed step had done (fds closed, the dump flag cleared, capabilities dropped).
 #[derive(Debug)]
 pub enum Error {
-    /// The guest's own preparation failed ([`Confined::before_lockdown`]).
-    Guest(Box<dyn std::error::Error + Send + Sync>),
+    /// The config has no gate ([`Config::gate`]).
+    NoGate,
     /// Other host threads exist (their tids): they would run code nobody checked, under the filter.
     Threads(Vec<i32>),
     /// A granted fd isn't open.
@@ -190,7 +176,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Guest(e) => write!(f, "{e}"),
+            Error::NoGate => write!(f, "no gate: lockdown needs the address host calls may come from"),
             Error::Threads(tids) => write!(
                 f,
                 "{} other host thread(s) at lockdown (tids {tids:?}): only the calling thread may exist, \
@@ -211,28 +197,13 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-impl Error {
-    /// The guest's error, boxed: `Err(Error::guest(e))`, or `?` on an `io::Error`.
-    pub fn guest(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Error {
-        Error::Guest(e.into())
-    }
-}
-
-impl From<std::io::Error> for Error {
-    fn from(e: std::io::Error) -> Self {
-        Error::Guest(Box::new(e))
-    }
-}
-
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Lock the process down with `config` (the caller's grants: [`Config::grant`]). The registered
-/// guest's ([`register`]) preparation runs first ([`Confined::before_lockdown`]); its grants are
-/// added and its mode is the filter's. Then, in this order:
+/// Lock the process down with `config`, and nothing else. In this order:
 ///
 /// 1. exactly one thread, the caller's (`/proc/self/task`; a thread just joined gets a few ms
 ///    to vanish). Every check after this one can't be raced;
-/// 2. the guest's own fds ([`Confined::host_fds`]) kind-checked: eventfds, and pidfds in fork
+/// 2. the guest's own fds ([`Config::guest_fds`]) kind-checked: eventfds, and pidfds in fork
 ///    mode only; every granted fd open;
 /// 3. every mapping kind-checked (`/proc/self/maps`): private, or shared and read-only, or (in
 ///    fork mode) shared anonymous memory; above all no writable shared mapping of a host file;
@@ -249,13 +220,8 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 ///
 /// On success the process is locked down ([`locked_down`]) and the caller hands over to the
 /// program. On failure nothing untrusted has run.
-pub fn lockdown(mut config: Config) -> Result<()> {
-    let none = NoGuest(config.mode);
-    let guest: &dyn Confined = GUEST.with(|g| g.get()).unwrap_or(&none);
-    guest.before_lockdown()?;
-    config.mode = guest.mode();
-    config.fds.extend(guest.grants());
-    lockdown::lockdown(config, guest)?;
+pub fn lockdown(config: Config) -> Result<()> {
+    lockdown::lockdown(config)?;
     LOCKED.store(true, std::sync::atomic::Ordering::SeqCst);
     Ok(())
 }

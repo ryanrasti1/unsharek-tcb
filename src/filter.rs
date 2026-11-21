@@ -8,7 +8,7 @@
 //! [`crate::lockdown`] installs it.
 //!
 //! **Shape.** 1. Another arch, or the x32 bit: KILL_PROCESS (the rows know only x86-64 numbers,
-//! and must not judge another ABI's). 2. Not from the gate ([`crate::Confined::gate_ip`]): TRAP,
+//! and must not judge another ABI's). 2. Not from the gate ([`crate::Config::gate`]): TRAP,
 //! the program's call, served in-process by the runtime's SIGSYS handler; every thread and
 //! process made after lockdown inherits the filter, so this is how all of them are served. The
 //! gate's address is the guest's value, which a reviewer needn't trust: this check returns only
@@ -106,7 +106,7 @@ seccomp_fn_verify::policy!(policy, filter, unwind = 128, (
 
 /// The filter for `mode` and `ppoll_max` ([`crate::Config`]'s): [`policy`]'s program. `pid` is
 /// the process's own (the one `kill` may signal), `gate` the gate's
-/// ([`crate::Confined::gate_ip`]), `ctl` the control socket's, if any, and the floor of closable fds. Public, so the
+/// ([`crate::Config::gate`]), `ctl` the control socket's, if any, and the floor of closable fds. Public, so the
 /// exact program can be inspected and tested.
 pub fn filter(mode: Mode, pid: u64, ppoll_max: u64, gate: u64, ctl: Option<(u64, u64)>) -> Vec<sock_filter> {
     seccomp_fn::compile!(policy(mode, pid, ppoll_max, gate, ctl))

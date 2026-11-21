@@ -14,7 +14,7 @@ use rustix::process::{DumpableBehavior, Resource, Rlimit};
 use rustix::thread::{CapabilitySet, CapabilitySets};
 
 use crate::filter;
-use crate::{Config, Confined, Error, Mode, Result};
+use crate::{Config, Error, Mode, Result};
 
 fn os(what: &'static str) -> impl FnOnce(io::Error) -> Error {
     move |source| Error::Os { what, source }
@@ -38,9 +38,10 @@ pub fn check_ns() -> u64 {
     CHECK_NS.load(Ordering::Relaxed)
 }
 
-pub(crate) fn lockdown<C: Confined + ?Sized>(config: Config, guest: &C) -> Result<()> {
+pub(crate) fn lockdown(config: Config) -> Result<()> {
     let mode = config.mode;
-    let guest_fds: Vec<RawFd> = guest.host_fds();
+    let gate = config.gate.ok_or(Error::NoGate)?;
+    let guest_fds: Vec<RawFd> = config.guest_fds.clone();
     let grants = config.fds.clone();
     // The kept fds: the grants, and the guest's. The filter is compiled first: it allocates,
     // and checks nothing.
@@ -52,7 +53,7 @@ pub(crate) fn lockdown<C: Confined + ?Sized>(config: Config, guest: &C) -> Resul
     let floor = all.fds.iter().copied().max().unwrap_or(2).max(2) as u64 + 1;
     let ctl = all.recv_fds.map(|fd| (fd as u64, floor));
     let pid = rustix::process::getpid().as_raw_nonzero().get() as u32;
-    let prog = filter::filter(all.mode, pid as u64, all.ppoll_max, guest.gate_ip(), ctl);
+    let prog = filter::filter(all.mode, pid as u64, all.ppoll_max, gate, ctl);
 
     let t = Instant::now();
     // The checks read /proc/self: it must be the kernel's procfs, not whatever is mounted there

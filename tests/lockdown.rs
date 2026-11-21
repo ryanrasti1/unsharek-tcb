@@ -6,7 +6,7 @@
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
-use unsharek_tcb::{Config, Confined, Error, Mode};
+use unsharek_tcb::{Config, Error, Mode};
 
 // ------------------------------------------------------------------------------------------------
 // A gate, and a SIGSYS handler that returns through it.
@@ -97,22 +97,10 @@ struct Guest {
     mode: Mode,
 }
 
-impl Confined for Guest {
-    fn host_fds(&self) -> Vec<RawFd> {
-        self.fds.clone()
-    }
-    fn mode(&self) -> Mode {
-        self.mode
-    }
-    fn gate_ip(&self) -> u64 {
-        gate_ip()
-    }
-}
 
 /// Lockdown for `guest`, in its mode, with the grants `grants` makes.
 fn lockdown(guest: &Guest, grants: impl FnOnce(&mut Config)) -> unsharek_tcb::Result<()> {
-    unsharek_tcb::register(Box::leak(Box::new(Guest { fds: guest.fds.clone(), mode: guest.mode })));
-    let mut c = Config::default();
+    let mut c = Config::new().mode(guest.mode).guest_fds(guest.fds.iter().copied()).gate(gate_ip());
     grants(&mut c);
     unsharek_tcb::lockdown(c)
 }
@@ -161,7 +149,7 @@ fn locks_down_and_probes() {
             install_handler();
             let guest = Guest { fds: vec![efd], mode };
             let r = lockdown(&guest, |s| {
-                s.grant(1).grant(2).grant(ro_fd);
+                s.fds.extend([1, 2, ro_fd]);
             });
             if r.is_err() {
                 return 1;
@@ -219,7 +207,7 @@ fn each_refused_call_kills() {
             let ro_fd = ro.as_raw_fd();
             let guest = Guest { fds: vec![], mode: Mode::Coroutine };
             if lockdown(&guest, |s| {
-                s.grant(ro_fd);
+                s.fds.extend([ro_fd]);
             })
             .is_err()
             {
@@ -250,7 +238,7 @@ fn no_core_dumps() {
     if pid == 0 {
         let guest = Guest { fds: vec![], mode: Mode::Coroutine };
         let ok = lockdown(&guest, |s| {
-            s.grant(p[0]).grant(q[1]);
+            s.fds.extend([p[0], q[1]]);
         })
         .is_ok();
         let b = [ok as u8];
@@ -420,7 +408,7 @@ fn refuses_a_second_thread() {
 fn refuses_a_closed_grant() {
     let got = exit_code(in_child(|| {
         match lockdown(&Guest { fds: vec![], mode: Mode::Coroutine }, |s| {
-            s.grant(900);
+            s.fds.extend([900]);
         }) {
             Err(Error::NotOpen(900)) => 0,
             _ => 1,

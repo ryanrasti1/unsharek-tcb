@@ -5,7 +5,7 @@
 
 use std::os::fd::RawFd;
 
-use unsharek_tcb::{Config, Confined, Error, Mode};
+use unsharek_tcb::{Config, Error, Mode};
 
 /// The test's gate: `nr(a0, a1, a2)`, raw result.
 #[unsafe(naked)]
@@ -38,21 +38,9 @@ struct Guest {
     mode: Mode,
 }
 
-impl Confined for Guest {
-    fn host_fds(&self) -> Vec<RawFd> {
-        self.fds.clone()
-    }
-    fn mode(&self) -> Mode {
-        self.mode
-    }
-    fn gate_ip(&self) -> u64 {
-        &raw const unsharek_tcb_ctl_gate_ret as u64
-    }
-}
 
 fn lockdown(guest: &Guest, grants: impl FnOnce(&mut Config)) -> unsharek_tcb::Result<()> {
-    unsharek_tcb::register(Box::leak(Box::new(Guest { fds: guest.fds.clone(), mode: guest.mode })));
-    let mut c = Config::default();
+    let mut c = Config::new().mode(guest.mode).guest_fds(guest.fds.iter().copied()).gate(&raw const unsharek_tcb_ctl_gate_ret as u64);
     grants(&mut c);
     unsharek_tcb::lockdown(c)
 }
@@ -151,7 +139,7 @@ fn control_socket_receives_fds() {
             let guest = Guest { fds: vec![eventfd()], mode };
             if lockdown(&guest, |s| {
                 s.recv_fds = Some(ctl);
-                s.grant(pipe[0]);
+                s.fds.extend([pipe[0]]);
             })
             .is_err()
             {
@@ -186,7 +174,7 @@ fn control_socket_refusals_kill() {
             let guest = Guest { fds: vec![eventfd()], mode: Mode::Coroutine };
             if lockdown(&guest, |s| {
                 s.recv_fds = Some(ctl);
-                s.grant(other);
+                s.fds.extend([other]);
             })
             .is_err()
             {
@@ -266,11 +254,11 @@ fn close_received_only() {
             let efd = eventfd();
             let guest = Guest { fds: vec![efd], mode: Mode::Coroutine };
             let r = lockdown(&guest, |s| {
-                s.grant(1);
+                s.fds.extend([1]);
                 if which != 3 {
                     s.recv_fds = Some(ctl);
                 } else {
-                    s.grant(ctl);
+                    s.fds.extend([ctl]);
                 }
             });
             if r.is_err() {
