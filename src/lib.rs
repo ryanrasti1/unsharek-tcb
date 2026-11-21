@@ -43,7 +43,7 @@
 //!   dumpable, so the host's same user can't attach);
 //! - **no shared anonymous memory from elsewhere**: fork mode's `MAP_SHARED | MAP_ANONYMOUS`
 //!   memory is the sandbox's own, not inherited from a host process (the paranoia check looks
-//!   for another process mapping the same memory);
+//!   for an ancestor mapping the same memory);
 //! - **no unknown fds**: each granted fd is what the caller means to give (read and write on it
 //!   are the program's); lockdown checks only that it is open (the paranoia check refuses some
 //!   kinds that can't be meant: another process's memory, io_uring, userfaultfd, …).

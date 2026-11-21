@@ -817,3 +817,21 @@ fn fs_without_landlock() {
     }));
     assert_eq!(code, 0);
 }
+
+/// Fork mode's shared anonymous memory inherited from the parent, which still maps it: the
+/// paranoia check refuses it.
+#[test]
+fn paranoia_refuses_inherited_shared_memory() {
+    let rw = libc::PROT_READ | libc::PROT_WRITE;
+    // SAFETY: a fresh shared mapping in the test process, inherited by the child.
+    let p = unsafe { libc::mmap(std::ptr::null_mut(), 4096, rw, libc::MAP_SHARED | libc::MAP_ANONYMOUS, -1, 0) };
+    assert_ne!(p, libc::MAP_FAILED);
+    let code = exit_code(in_child(|| match lockdown(&Guest { fds: vec![], mode: Mode::Fork }, |_| ()) {
+        Err(Error::Paranoia(m)) if m.contains("ancestor") => 0,
+        Ok(_) => 1,
+        Err(_) => 2,
+    }));
+    // SAFETY: ours.
+    unsafe { libc::munmap(p, 4096) };
+    assert_eq!(code, 0);
+}

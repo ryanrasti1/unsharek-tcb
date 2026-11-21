@@ -384,19 +384,35 @@ fn paranoia(proc: &OwnedFd, mode: Mode, keep: &[RawFd]) -> Result<()> {
             break;
         }
     }
-    // Fork mode: no other process maps the shared anonymous memory (by its device and inode).
+    // Fork mode: the shared anonymous memory is the sandbox's own. Memory shared from elsewhere
+    // was inherited (a MAP_SHARED mapping survives fork): so no ancestor maps the same memory
+    // (by its device and inode). Ancestors only, not every process: reading every process's
+    // maps took seconds with many sandboxes running.
     if mode == Mode::Fork {
         let maps = read_at(proc, "maps").map_err(os("/proc/self/maps"))?;
-        let shared: Vec<String> = maps.lines().filter(|l| l.contains(" rw-s ") && l.ends_with("/dev/zero (deleted)")).filter_map(|l| {
-            let f: Vec<&str> = l.split_whitespace().collect();
-            (f.len() >= 5).then(|| format!(" {} {} ", f[3], f[4]))
-        }).collect();
-        if !shared.is_empty() {
-            for &pid in &pids {
-                let Ok(theirs) = read_at(&root, &format!("{pid}/maps")) else { continue };
-                if let Some(l) = theirs.lines().find(|l| shared.iter().any(|k| l.contains(k.as_str()))) {
-                    return bad(format!("pid {pid} maps this process's shared memory: {l}"));
-                }
+        let shared: Vec<String> = maps
+            .lines()
+            .filter(|l| l.contains(" rw-s ") && l.ends_with("/dev/zero (deleted)"))
+            .filter_map(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                (f.len() >= 5).then(|| format!(" {} {} ", f[3], f[4]))
+            })
+            .collect();
+        let mut pid = me;
+        while !shared.is_empty() && pid > 1 {
+            let Some(ppid) = read_at(&root, &format!("{pid}/status"))
+                .ok()
+                .and_then(|s| s.lines().find_map(|l| l.strip_prefix("PPid:").and_then(|p| p.trim().parse::<i32>().ok())))
+            else {
+                break;
+            };
+            pid = ppid;
+            if pid <= 0 {
+                break;
+            }
+            let Ok(theirs) = read_at(&root, &format!("{pid}/maps")) else { continue };
+            if let Some(l) = theirs.lines().find(|l| shared.iter().any(|k| l.contains(k.as_str()))) {
+                return bad(format!("pid {pid} (an ancestor) maps this process's shared memory: {l}"));
             }
         }
     }
