@@ -83,12 +83,27 @@ pub(crate) fn lockdown(config: Config) -> Result<Fds> {
         // lockdown, and the pidfd is only polled: no pidfd_send_signal or waitid is allowed).
         // Nothing else: a file, a socket, a pipe posing as one would get read and write without
         // the caller's grant.
-        for &fd in &guest_fds {
+        // Exactly the mode's (README.md's "kept per mode"): none in coroutine mode; a CPU token
+        // per host-thread slot in threaded and fork mode; and init's pidfd in fork mode.
+        let (mut eventfds, mut pidfds) = (0, 0);
+        let mut distinct = guest_fds.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        for &fd in &distinct {
             let kind = fd_kind(&proc, fd).map_err(|_| Error::NotOpen(fd))?;
-            let ok = kind == "anon_inode:[eventfd]" || (mode == Mode::Fork && kind == "anon_inode:[pidfd]");
-            if !ok {
-                return Err(Error::FdKind { fd, kind });
+            match kind.as_str() {
+                "anon_inode:[eventfd]" if mode != Mode::Coroutine => eventfds += 1,
+                "anon_inode:[pidfd]" if mode == Mode::Fork => pidfds += 1,
+                _ => return Err(Error::FdKind { fd, kind }),
             }
+        }
+        let want = match mode {
+            Mode::Coroutine => (0, 0),
+            Mode::Threaded => (crate::TOKEN_FDS, 0),
+            Mode::Fork => (crate::TOKEN_FDS, 1),
+        };
+        if (eventfds, pidfds) != want {
+            return Err(Error::GuestFds { mode, eventfds, pidfds });
         }
         for &fd in &grants {
             // Open: /proc/self/fd has it, as for the guest's (no fd borrowed unsafely).

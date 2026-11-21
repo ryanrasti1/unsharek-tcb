@@ -99,6 +99,10 @@ pub enum Fs {
     ReadWrite,
 }
 
+/// The guest's CPU-token eventfds in threaded and fork mode: one per host-thread slot (128 for
+/// the program's threads, one for the kernel's).
+pub const TOKEN_FDS: usize = 129;
+
 /// The process locked down ([`lockdown`] succeeded).
 static LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -163,9 +167,10 @@ impl Config {
         self
     }
 
-    /// The guest's own host fds, kept past lockdown, read and write: its CPU tokens' eventfds
-    /// (`anon_inode:[eventfd]`) and, in fork mode, init's pidfd (`anon_inode:[pidfd]`). Lockdown
-    /// refuses any other kind (a pidfd in another mode too).
+    /// The guest's own host fds, kept past lockdown, read and write: exactly the mode's. None in
+    /// coroutine mode; [`TOKEN_FDS`] eventfds (`anon_inode:[eventfd]`, the CPU tokens: one per
+    /// host-thread slot) in threaded and fork mode; and in fork mode init's pidfd
+    /// (`anon_inode:[pidfd]`). Lockdown refuses any other kind, or count.
     pub fn guest_fds(mut self, fds: impl IntoIterator<Item = RawFd>) -> Self {
         self.guest_fds.extend(fds);
         self
@@ -244,6 +249,8 @@ pub enum Error {
     NotOpen(RawFd),
     /// A guest fd of a kind it can't be (its `/proc/self/fd` link).
     FdKind { fd: RawFd, kind: String },
+    /// The guest's fds aren't the mode's: their eventfds and pidfds counted ([`Config::guest_fds`]).
+    GuestFds { mode: Mode, eventfds: usize, pidfds: usize },
     /// A mapping lockdown refuses (its `/proc/self/maps` line): writable and shared with something
     /// outside the sandbox.
     Mapping(String),
@@ -273,6 +280,11 @@ impl fmt::Display for Error {
             Error::FdKind { fd, kind } => {
                 write!(f, "the guest's fd {fd} is {kind:?}, not an eventfd or a pidfd")
             }
+            Error::GuestFds { mode, eventfds, pidfds } => write!(
+                f,
+                "the guest's fds in {mode:?} mode: {eventfds} eventfds and {pidfds} pidfds, not the mode's (coroutine none; \
+                 threaded {TOKEN_FDS} eventfds; fork {TOKEN_FDS} eventfds and one pidfd)"
+            ),
             Error::Mapping(line) => write!(f, "a mapping shared with the host, writable: {line}"),
             Error::Paranoia(what) => write!(f, "paranoia: {what}"),
             Error::Landlock(what) => write!(f, "landlock: {what}"),
