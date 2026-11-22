@@ -3,7 +3,10 @@
 //! in seconds: the same assertion sampled (seccomp-fn-verify's `check_sampled`), for each mode
 //! and some params; README.md's table against the policy's rows.
 
-use unsharek_tcb::{AUDIT_ARCH_X86_64, Fs, Mode, PPOLL_FDS, PPOLL_NET_FDS, RET_ALLOW, filter, policy, seccomp_data, sock_filter};
+use unsharek_tcb::plugin::{Fs, Net};
+use unsharek_tcb::{AUDIT_ARCH_X86_64, Mode, PPOLL_FDS, RET_ALLOW, filter, policy, seccomp_data, sock_filter};
+
+const PPOLL_NET_FDS: u64 = Net::PPOLL_FDS;
 
 const GATE: u64 = 0x0000_7f12_3456_7890;
 /// The fd floor the tests use: kept fds 0..N.
@@ -17,8 +20,8 @@ fn filter_is_the_policy() {
     for mode in MODES {
         for fs in FSES {
             for net in [false, true] {
-                for (n, ppoll_max, gate) in [(N, PPOLL_FDS, GATE), (0, 0, 0), (u64::MAX, 3, u64::MAX), (3, u64::MAX, 1 << 32)] {
-                    seccomp_fn_verify::check_sampled(policy, filter, (mode, n, ppoll_max, gate, fs, net), 2_000);
+                for (n, gate) in [(N, GATE), (0, 0), (u64::MAX, u64::MAX), (3, 1 << 32)] {
+                    seccomp_fn_verify::check_sampled(policy, filter, (mode, n, gate, fs, net), 2_000);
                 }
             }
         }
@@ -37,19 +40,19 @@ fn allowed(fs: Fs, net: bool, d: &seccomp_data) -> bool {
 
 /// [`allowed`], in `mode`.
 fn allowed_in(mode: Mode, fs: Fs, net: bool, d: &seccomp_data) -> bool {
-    policy(mode, N, PPOLL_FDS, GATE, fs, net)(d) == RET_ALLOW
+    policy(mode, N, GATE, fs, net)(d) == RET_ALLOW
 }
 
 /// The numbers [`policy`] allows in `mode` without plugins, for some arguments: every x86-64
 /// number, each tried with the arguments the program compares with (its jumps' constants).
 fn ruled(mode: Mode) -> std::collections::BTreeSet<u32> {
-    let prog = filter(mode, N, PPOLL_FDS, GATE, Fs::Off, false);
+    let prog = filter(mode, N, GATE, Fs::Off, false);
     let k: Vec<u64> = prog.iter().filter(|i| i.code & 0x07 == 0x05).map(|i| i.k as u64).chain([0, 1]).collect();
     let mut out = std::collections::BTreeSet::new();
     for nr in 0..1024u32 {
         for &a0 in &k {
             for &a1 in &k {
-                if policy(mode, N, PPOLL_FDS, GATE, Fs::Off, false)(&call(nr as i64, [a0, a1, 0, 0, 0, 0])) == RET_ALLOW {
+                if policy(mode, N, GATE, Fs::Off, false)(&call(nr as i64, [a0, a1, 0, 0, 0, 0])) == RET_ALLOW {
                     out.insert(nr);
                 }
             }
@@ -65,7 +68,7 @@ fn program_rows(mode: Mode, fs: Fs, net: bool) -> Vec<Vec<u32>> {
     let ld_nr = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
     let jeq = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
     let off_nr = std::mem::offset_of!(libc::seccomp_data, nr) as u32;
-    let prog: Vec<sock_filter> = filter(mode, N, PPOLL_FDS, GATE, fs, net);
+    let prog: Vec<sock_filter> = filter(mode, N, GATE, fs, net);
     let mut out: Vec<Vec<u32>> = vec![];
     let mut in_row = false;
     let mut row_start = true;
@@ -184,7 +187,7 @@ fn readme_table_is_the_policy() {
             }
         }
     }
-    assert_eq!(lines.len(), 26, "README.md's allowlist tables: their rows (6 core, 11 fs, 9 net)");
+    assert_eq!(lines.len(), 24, "README.md's allowlist tables: their rows (6 core, 9 fs, 9 net)");
 }
 
 /// The program's length in each mode and plugin choice (the kernel takes 4096).
@@ -193,7 +196,7 @@ fn filter_length() {
     for mode in MODES {
         for fs in FSES {
             for net in [false, true] {
-                let n = filter(mode, N, PPOLL_FDS, GATE, fs, net).len();
+                let n = filter(mode, N, GATE, fs, net).len();
                 eprintln!("{mode:?} {fs:?} net {net}: {n} instructions");
                 assert!(n <= 1000, "{mode:?}: {n} instructions");
             }
@@ -221,7 +224,7 @@ fn read_write_any_fd() {
     }
 }
 
-/// `ppoll`: `ppoll_max` fds, or with the net plugin `PPOLL_NET_FDS`; never a signal mask.
+/// `ppoll`: `PPOLL_FDS` fds, or with the net plugin `PPOLL_NET_FDS`; never a signal mask.
 #[test]
 fn ppoll_bound() {
     let pp = |nfds: u64, mask: u64| call(libc::SYS_ppoll, [0, nfds, 0, mask, 8, 0]);

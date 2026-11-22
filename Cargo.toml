@@ -22,3 +22,7 @@ rustix = { version = "1", default-features = false, features = ["std", "thread",
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
+[features]
+# The tests' and benches' hooks (lockdown's timings, `map_ok`): never part of the API.
+testing = []

@@ -15,9 +15,9 @@ use rustix::process::{DumpableBehavior, Resource, Rlimit};
 use rustix::thread::{CapabilitySet, CapabilitySets};
 
 use crate::plugin::{self, Plugin};
-use crate::{Config, Error, Mode, Result};
+use crate::{Config, Error, Kind, Mode, Result, filter};
 
-fn os(what: &'static str) -> impl FnOnce(io::Error) -> Error {
+pub(crate) fn os(what: &'static str) -> impl FnOnce(io::Error) -> Error {
     move |source| Error::Os { what, source }
 }
 
@@ -26,44 +26,48 @@ fn last_os(what: &'static str) -> Error {
 }
 
 /// rustix's error, as [`os`].
-fn rx(what: &'static str) -> impl FnOnce(Errno) -> Error {
+pub(crate) fn rx(what: &'static str) -> impl FnOnce(Errno) -> Error {
     move |e| Error::Os { what, source: e.into() }
 }
 
-/// How long the last lockdown's checks (steps 1-3: threads, fds, mappings) took, in ns: for
-/// measuring, not a policy.
+/// How long the last lockdown's checks took, in ns: steps 1-3 (threads, fds, mappings), step 2
+/// (threads and fds), and the paranoia check (0: off). For measuring, not a policy.
 static CHECK_NS: AtomicU64 = AtomicU64::new(0);
-
-#[doc(hidden)]
-pub fn check_ns() -> u64 {
-    CHECK_NS.load(Ordering::Relaxed)
-}
-
-/// How long the last lockdown's paranoia check took, in ns (0: off).
+static FD_NS: AtomicU64 = AtomicU64::new(0);
 static PARANOIA_NS: AtomicU64 = AtomicU64::new(0);
 
-#[doc(hidden)]
-pub fn paranoia_ns() -> u64 {
-    PARANOIA_NS.load(Ordering::Relaxed)
+/// The last lockdown's times, in ns: (checks, threads and fds, paranoia).
+#[cfg(feature = "testing")]
+pub fn times_ns() -> (u64, u64, u64) {
+    (CHECK_NS.load(Ordering::Relaxed), FD_NS.load(Ordering::Relaxed), PARANOIA_NS.load(Ordering::Relaxed))
 }
 
 pub(crate) fn lockdown(config: Config, plugins: &[&dyn Plugin]) -> Result<()> {
     let mode = config.mode;
-    let gate = config.gate.ok_or(Error::NoGate)?;
-    let guest_fds: Vec<RawFd> = config.guest_fds.clone();
-    // A plugin's kept fds are kept as grants are.
-    let grants: Vec<RawFd> = config.fds.iter().copied().chain(plugins.iter().flat_map(|p| p.kept().iter().map(|k| k.0))).collect();
-    // The kept fds: the grants and the guest's, exactly 0..n (the caller put them there: no
-    // renumbering here). The filter is compiled first (it allocates, and checks nothing).
-    let mut keep: Vec<RawFd> = grants.iter().chain(&guest_fds).copied().collect();
-    keep.sort_unstable();
-    keep.dedup();
+    // The kept fds, each with its declared kind (a plugin's kept as grants are): exactly 0..n,
+    // the caller put them there (no renumbering here). The filter is compiled first (it
+    // allocates, and checks nothing).
+    let mut keep: Vec<(RawFd, Kind)> = config.fds.iter().copied().chain(plugins.iter().flat_map(|p| p.kept().iter().map(|k| (k.0, Kind::Any)))).collect();
+    keep.sort_by_key(|k| k.0);
+    keep.dedup_by_key(|k| k.0);
     let n = keep.len() as RawFd;
-    if let Some(gap) = (0..n).find(|fd| keep.binary_search(fd).is_err()) {
+    if let Some(gap) = (0..n).find(|&i| keep[i as usize].0 != i) {
         return Err(Error::Gap { gap, n });
     }
+    // The mode's own, by declared kind: eventfds (the CPU tokens) only in threaded and fork mode;
+    // a pidfd (init's: each forked process polls it to end with init) only in fork mode.
+    for &(fd, kind) in &keep {
+        let ok = match kind {
+            Kind::Any => true,
+            Kind::Eventfd => mode != Mode::Coroutine,
+            Kind::Pidfd => mode == Mode::Fork,
+        };
+        if !ok {
+            return Err(Error::ModeKind { fd, kind, mode });
+        }
+    }
     let (fs, net) = plugin::rows(plugins);
-    let prog = plugin::filter(mode, n as u64, config.ppoll_max, gate, fs, net);
+    let prog = filter::filter(mode, n as u64, config.gate, fs, net);
     // What the plugins need of the kernel (the file plugin's Landlock): refused now, before
     // anything changes, if not there.
     for p in plugins {
@@ -73,12 +77,12 @@ pub(crate) fn lockdown(config: Config, plugins: &[&dyn Plugin]) -> Result<()> {
     {
         // Every read of /proc is through this one fd, checked to be the kernel's procfs (not
         // whatever is mounted at /proc: a FUSE or tmpfs there could answer anything), and its
-        // process to be this one (step 1 finds this thread's tid in it). Closed before step 4.
+        // process to be this one (step 1 finds this thread's tid in it). Closed by step 4.
         let proc = proc_self(n)?;
-        // 0. The assumptions, best-effort.
+        // 0. The assumptions, best-effort (paranoia.rs).
         if config.paranoia {
             let t = Instant::now();
-            paranoia(&proc, mode, &keep)?;
+            crate::paranoia::check(&proc, mode)?;
             PARANOIA_NS.store(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         } else {
             PARANOIA_NS.store(0, Ordering::Relaxed);
@@ -86,40 +90,21 @@ pub(crate) fn lockdown(config: Config, plugins: &[&dyn Plugin]) -> Result<()> {
         let t = Instant::now();
         // 1. One thread.
         one_thread(&proc)?;
-        // 2. The guest's fds: an eventfd each (a CPU token), or in fork mode a pidfd (init's: each
-        // forked process polls it to end with init; PR_SET_PDEATHSIG would need a prctl after
-        // lockdown, and the pidfd is only polled: no pidfd_send_signal or waitid is allowed).
-        // Nothing else: a file, a socket, a pipe posing as one would get read and write without
-        // the caller's grant.
-        // Exactly the mode's (README.md's "kept per mode"): none in coroutine mode; a CPU token
-        // per host-thread slot in threaded and fork mode; and init's pidfd in fork mode.
-        let (mut eventfds, mut pidfds) = (0, 0);
-        let mut distinct = guest_fds.clone();
-        distinct.sort_unstable();
-        distinct.dedup();
-        for &fd in &distinct {
-            let kind = fd_kind(&proc, fd).map_err(|_| Error::NotOpen(fd))?;
-            match kind.as_str() {
-                "anon_inode:[eventfd]" if mode != Mode::Coroutine => eventfds += 1,
-                "anon_inode:[pidfd]" if mode == Mode::Fork => pidfds += 1,
-                _ => return Err(Error::FdKind { fd, kind }),
-            }
-        }
-        let want = match mode {
-            Mode::Coroutine => (0, 0),
-            Mode::Threaded => (crate::TOKEN_FDS, 0),
-            Mode::Fork => (crate::TOKEN_FDS, 1),
-        };
-        if (eventfds, pidfds) != want {
-            return Err(Error::GuestFds { mode, eventfds, pidfds });
-        }
-        for &fd in &grants {
-            // Open (F_GETFD), and /proc/self/fd has it, as for the guest's.
+        // 2. Each kept fd open (F_GETFD), of its declared kind, and of no kind refused.
+        for &(fd, kind) in &keep {
             // SAFETY: fcntl on this process's fd.
-            if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 || fd_kind(&proc, fd).is_err() {
-                return Err(Error::NotOpen(fd));
+            let link = if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 { None } else { fd_kind(&proc, fd).ok() };
+            let Some(link) = link else { return Err(Error::NotOpen(fd)) };
+            let declared = match kind {
+                Kind::Any => true,
+                Kind::Eventfd => link == "anon_inode:[eventfd]",
+                Kind::Pidfd => link == "anon_inode:[pidfd]",
+            };
+            if !declared || refused_kind(&proc, fd, &link) {
+                return Err(Error::FdKind { fd, kind, link });
             }
         }
+        FD_NS.store(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         // 3. Every mapping.
         check_maps(&proc, mode)?;
         CHECK_NS.store(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -134,7 +119,8 @@ pub(crate) fn lockdown(config: Config, plugins: &[&dyn Plugin]) -> Result<()> {
     // 5. No core dump, not dumpable.
     rustix::process::setrlimit(Resource::Core, Rlimit { current: Some(0), maximum: Some(0) }).map_err(rx("RLIMIT_CORE"))?;
     rustix::process::set_dumpable_behavior(DumpableBehavior::NotDumpable).map_err(rx("PR_SET_DUMPABLE"))?;
-    // 6. Capabilities.
+    // 6. Capabilities: CAP_DAC_OVERRIDE would let the file plugin's openat read root-only files
+    // inside its roots; otherwise defence in depth.
     drop_capabilities()?;
     // 7. no_new_privs: unprivileged seccomp needs it, and no exec gains anything after.
     rustix::thread::set_no_new_privs(true).map_err(rx("PR_SET_NO_NEW_PRIVS"))?;
@@ -164,7 +150,7 @@ fn proc_self(n: RawFd) -> Result<OwnedFd> {
 }
 
 /// `name` under `dir`, read whole.
-fn read_at(dir: &OwnedFd, name: &str) -> io::Result<String> {
+pub(crate) fn read_at(dir: &OwnedFd, name: &str) -> io::Result<String> {
     let f = rustix::fs::openat(dir, name, OFlags::RDONLY | OFlags::CLOEXEC, FsMode::empty())?;
     let mut s = String::new();
     io::Read::read_to_string(&mut std::fs::File::from(f), &mut s)?;
@@ -172,7 +158,7 @@ fn read_at(dir: &OwnedFd, name: &str) -> io::Result<String> {
 }
 
 /// The numeric entries of directory `name` under `dir` (tids, pids).
-fn numbers_at(dir: &OwnedFd, name: &str) -> io::Result<Vec<i32>> {
+pub(crate) fn numbers_at(dir: &OwnedFd, name: &str) -> io::Result<Vec<i32>> {
     let d = rustix::fs::openat(dir, name, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, FsMode::empty())?;
     let mut out = vec![];
     for e in rustix::fs::Dir::read_from(&d)? {
@@ -205,88 +191,34 @@ fn one_thread(proc: &OwnedFd) -> Result<()> {
 }
 
 /// `/proc/self/fd/<fd>`'s link: what the fd is (`anon_inode:[eventfd]`, `socket:[123]`, a path).
-fn fd_kind(proc: &OwnedFd, fd: RawFd) -> io::Result<String> {
+pub(crate) fn fd_kind(proc: &OwnedFd, fd: RawFd) -> io::Result<String> {
     let link = rustix::fs::readlinkat(proc, format!("fd/{fd}"), Vec::new())?;
     Ok(link.to_string_lossy().into_owned())
 }
 
-/// Step 0: the crate's "Assumptions", as far as /proc shows them. Best-effort: a process whose
-/// entries this one may not read is skipped.
-fn paranoia(proc: &OwnedFd, mode: Mode, keep: &[RawFd]) -> Result<()> {
-    let bad = |s: String| Err(Error::Paranoia(s));
-    // No tracer: it could change the memory and registers lockdown checked.
-    let status = read_at(proc, "status").map_err(os("/proc/self/status"))?;
-    if let Some(t) = status.lines().find_map(|l| l.strip_prefix("TracerPid:"))
-        && t.trim() != "0" {
-            return bad(format!("traced by pid {}", t.trim()));
-        }
-    // No kept fd of a kind no caller means to give: read and write on it would reach past the
-    // sandbox (another process's memory, the kernel's) or act asynchronously (io_uring).
-    for &fd in keep {
-        let Ok(kind) = fd_kind(proc, fd) else { continue };
-        let refused = ["anon_inode:[io_uring]", "anon_inode:[userfaultfd]", "anon_inode:[perf_event]", "anon_inode:[fanotify]", "anon_inode:seccomp notify", "anon_inode:bpf-", "/dev/mem", "/dev/kmem", "/dev/port"];
-        let proc_mem = kind.starts_with("/proc/") && kind.ends_with("/mem");
-        // A writable fd of /proc or /sys: the kernel's state (a sysctl, another process's).
-        let writable = read_at(proc, &format!("fdinfo/{fd}"))
+/// Step 2: kinds no caller means to give, refused on every kept fd: read and write on one would
+/// reach past the sandbox (another process's memory, the kernel's state) or act asynchronously
+/// (io_uring). `kind` is its `/proc/self/fd` link.
+fn refused_kind(proc: &OwnedFd, fd: RawFd, kind: &str) -> bool {
+    const REFUSED: [&str; 9] = [
+        "anon_inode:[io_uring]",
+        "anon_inode:[userfaultfd]",
+        "anon_inode:[perf_event]",
+        "anon_inode:[fanotify]",
+        "anon_inode:seccomp notify",
+        "anon_inode:bpf-",
+        "/dev/mem",
+        "/dev/kmem",
+        "/dev/port",
+    ];
+    let proc_mem = kind.starts_with("/proc/") && kind.ends_with("/mem");
+    // A writable fd of /proc or /sys: the kernel's state (a sysctl, another process's).
+    let kernel_state = (kind.starts_with("/proc/") || kind.starts_with("/sys/"))
+        && read_at(proc, &format!("fdinfo/{fd}"))
             .ok()
             .and_then(|i| i.lines().find_map(|l| l.strip_prefix("flags:").map(|f| u32::from_str_radix(f.trim(), 8).unwrap_or(0))))
-            .is_some_and(|f| f & libc::O_ACCMODE as u32 != libc::O_RDONLY as u32);
-        let kernel_state = writable && (kind.starts_with("/proc/") || kind.starts_with("/sys/"));
-        if refused.iter().any(|r| kind.starts_with(r)) || proc_mem || kernel_state {
-            return bad(format!("kept fd {fd} is {kind:?}"));
-        }
-    }
-    // The other processes, by their /proc entries (`..` of /proc/self: /proc itself).
-    let me = rustix::process::getpid().as_raw_nonzero().get();
-    let root = rustix::fs::openat(proc, "..", OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, FsMode::empty()).map_err(rx("/proc"))?;
-    let pids: Vec<i32> = numbers_at(&root, ".").map_err(os("/proc"))?.into_iter().filter(|&p| p != me).collect();
-    // No other process with this address space (a `CLONE_VM` child that isn't a thread, a
-    // `vfork` parent): TSYNC doesn't reach it, and it would run unfiltered on memory the program
-    // writes. kcmp(KCMP_VM) 0 is the same mm; ENOSYS (no CONFIG_KCMP) ends the look.
-    const KCMP_VM: i32 = 1;
-    for &pid in &pids {
-        // SAFETY: kcmp compares two processes' mms; it reads nothing of ours.
-        let r = unsafe { libc::syscall(libc::SYS_kcmp, me, pid, KCMP_VM, 0, 0) };
-        if r == 0 {
-            return bad(format!("pid {pid} shares this process's memory"));
-        }
-        if r < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS) {
-            break;
-        }
-    }
-    // Fork mode: the shared anonymous memory is the sandbox's own. Memory shared from elsewhere
-    // was inherited (a MAP_SHARED mapping survives fork): so no ancestor maps the same memory
-    // (by its device and inode). Ancestors only, not every process: reading every process's
-    // maps took seconds with many sandboxes running.
-    if mode == Mode::Fork {
-        let maps = read_at(proc, "maps").map_err(os("/proc/self/maps"))?;
-        let shared: Vec<String> = maps
-            .lines()
-            .filter(|l| l.contains(" rw-s ") && l.ends_with("/dev/zero (deleted)"))
-            .filter_map(|l| {
-                let f: Vec<&str> = l.split_whitespace().collect();
-                (f.len() >= 5).then(|| format!(" {} {} ", f[3], f[4]))
-            })
-            .collect();
-        let mut pid = me;
-        while !shared.is_empty() && pid > 1 {
-            let Some(ppid) = read_at(&root, &format!("{pid}/status"))
-                .ok()
-                .and_then(|s| s.lines().find_map(|l| l.strip_prefix("PPid:").and_then(|p| p.trim().parse::<i32>().ok())))
-            else {
-                break;
-            };
-            pid = ppid;
-            if pid <= 0 {
-                break;
-            }
-            let Ok(theirs) = read_at(&root, &format!("{pid}/maps")) else { continue };
-            if let Some(l) = theirs.lines().find(|l| shared.iter().any(|k| l.contains(k.as_str()))) {
-                return bad(format!("pid {pid} (an ancestor) maps this process's shared memory: {l}"));
-            }
-        }
-    }
-    Ok(())
+            .is_none_or(|f| f & libc::O_ACCMODE as u32 != libc::O_RDONLY as u32);
+    REFUSED.iter().any(|r| kind.starts_with(r)) || proc_mem || kernel_state
 }
 
 /// Step 3: every line of `/proc/self/maps` is one of
@@ -322,7 +254,7 @@ fn shm_dev() -> Result<String> {
 
 /// One `/proc/self/maps` line (`lo-hi perms offset dev inode [path]`), judged as [`check_maps`]
 /// says; `shm` the shmem device ([`shm_dev`]).
-pub fn map_ok(line: &str, mode: Mode, shm: &str) -> bool {
+pub(crate) fn map_ok(line: &str, mode: Mode, shm: &str) -> bool {
     let mut f = line.splitn(6, ' ');
     let (Some(_range), Some(perms), Some(_off), Some(dev), Some(_inode)) = (f.next(), f.next(), f.next(), f.next(), f.next())
     else {

@@ -7,7 +7,8 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 use unsharek_tcb::plugin::{Files, Net};
-use unsharek_tcb::{Config, Error, Mode};
+use unsharek_tcb::plugin::Fs;
+use unsharek_tcb::{Config, Error, Kind, Mode};
 
 // ------------------------------------------------------------------------------------------------
 // A gate, and a SIGSYS handler that returns through it.
@@ -100,18 +101,22 @@ struct Guest {
 
 
 /// Lockdown for `guest`, in its mode, with the grants `grants` makes.
-fn lockdown(guest: &Guest, grants: impl FnOnce(&mut Config)) -> unsharek_tcb::Result<Fds> {
+fn lockdown(guest: &Guest, grants: impl FnOnce(&mut Vec<RawFd>)) -> unsharek_tcb::Result<Fds> {
     with_plugins(guest, grants, &[])
 }
 
-/// [`lockdown`], with `plugins`. The kept fds are first put at `0..n`, as a caller does
-/// ([`arrange`]), the config's numbers changed to theirs.
-fn with_plugins(guest: &Guest, grants: impl FnOnce(&mut Config), plugins: &[&dyn unsharek_tcb::Plugin]) -> unsharek_tcb::Result<Fds> {
-    let mut c = Config::new().mode(guest.mode).guest_fds(mode_fds(guest.mode, &guest.fds)).gate(gate_ip());
-    grants(&mut c);
-    let fds = arrange(&c.fds.iter().chain(&c.guest_fds).copied().collect::<Vec<_>>());
-    c.fds = c.fds.iter().map(|&fd| fds.get(fd).unwrap()).collect();
-    c.guest_fds = c.guest_fds.iter().map(|&fd| fds.get(fd).unwrap()).collect();
+/// [`lockdown`], with `plugins`: `guest`'s fds (and the mode's, [`mode_fds`]) and the grants put
+/// at `0..n`, as a caller does ([`arrange`]), the guest's declared by their kind.
+fn with_plugins(guest: &Guest, grants: impl FnOnce(&mut Vec<RawFd>), plugins: &[&dyn unsharek_tcb::Plugin]) -> unsharek_tcb::Result<Fds> {
+    let own = mode_fds(guest.mode, &guest.fds);
+    let mut granted = vec![];
+    grants(&mut granted);
+    let fds = arrange(&own.iter().chain(&granted).copied().collect::<Vec<_>>());
+    let mut c = Config::new(gate_ip()).mode(guest.mode).grant(granted.iter().map(|&fd| fds.get(fd).unwrap()));
+    for &fd in &own {
+        let kind = if link(fd) == "anon_inode:[pidfd]" { Kind::Pidfd } else { Kind::Eventfd };
+        c = c.grant_as(kind, [fds.get(fd).unwrap()]);
+    }
     unsharek_tcb::lockdown(c, plugins).map(|()| fds)
 }
 
@@ -152,17 +157,19 @@ fn arrange(keep: &[RawFd]) -> Fds {
     Fds { n, map }
 }
 
-/// `fds` and what the mode keeps besides: threaded and fork mode's TOKEN_FDS eventfds (`fds`'
-/// own counted), fork mode's pidfd (unless `fds` has one). A test of a refusal passes its own
-/// set to `Config` directly.
+/// `fd`'s `/proc/self/fd` link.
+fn link(fd: RawFd) -> String {
+    std::fs::read_link(format!("/proc/self/fd/{fd}")).map(|l| l.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// `fds` and what the mode keeps besides: threaded and fork mode's CPU tokens (eventfds: a few,
+/// unless `fds` has one), fork mode's pidfd (unless `fds` has one).
 fn mode_fds(mode: Mode, fds: &[RawFd]) -> Vec<RawFd> {
-    let kind = |fd: RawFd| std::fs::read_link(format!("/proc/self/fd/{fd}")).map(|l| l.to_string_lossy().into_owned()).unwrap_or_default();
     let mut out = fds.to_vec();
-    if mode != Mode::Coroutine {
-        let have = fds.iter().filter(|&&fd| kind(fd) == "anon_inode:[eventfd]").count();
-        out.extend((have..unsharek_tcb::TOKEN_FDS).map(|_| eventfd()));
+    if mode != Mode::Coroutine && !fds.iter().any(|&fd| link(fd) == "anon_inode:[eventfd]") {
+        out.extend((0..3).map(|_| eventfd()));
     }
-    if mode == Mode::Fork && !fds.iter().any(|&fd| kind(fd) == "anon_inode:[pidfd]") {
+    if mode == Mode::Fork && !fds.iter().any(|&fd| link(fd) == "anon_inode:[pidfd]") {
         out.push(pidfd());
     }
     out
@@ -224,9 +231,9 @@ fn locks_down_and_probes() {
             // keeps no guest fd).
             let guest = Guest { fds: if mode == Mode::Coroutine { vec![] } else { vec![efd] }, mode };
             let r = lockdown(&guest, |s| {
-                s.fds.extend([1, 2, ro_fd]);
+                s.extend([1, 2, ro_fd]);
                 if mode == Mode::Coroutine {
-                    s.fds.push(efd);
+                    s.push(efd);
                 }
             });
             let Ok(f) = r else {
@@ -290,7 +297,7 @@ fn each_refused_call_kills() {
             let ro_fd = ro.as_raw_fd();
             let guest = Guest { fds: vec![], mode: Mode::Coroutine };
             let Ok(f) = lockdown(&guest, |s| {
-                s.fds.extend([ro_fd]);
+                s.extend([ro_fd]);
             }) else {
                 return 1;
             };
@@ -319,7 +326,7 @@ fn no_core_dumps() {
     if pid == 0 {
         let guest = Guest { fds: vec![], mode: Mode::Coroutine };
         let Ok(f) = lockdown(&guest, |s| {
-            s.fds.extend([p[0], q[1]]);
+            s.extend([p[0], q[1]]);
         }) else {
             g(libc::SYS_exit_group, [9, 0, 0]);
             unreachable!();
@@ -434,37 +441,33 @@ fn shared_anonymous_memory_in_fork_mode_only() {
     }
 }
 
-/// A guest fd that is not an eventfd or a pidfd (a file, a socket, a pipe posing as one, which
-/// would get read and write without a grant): refused. An eventfd and a pidfd pass.
+/// A fd declared an eventfd (a CPU token) that isn't one (a file, a pipe posing as one, which
+/// would get read and write as the guest's own): refused. An eventfd and a pidfd pass.
 #[test]
 fn refuses_a_guest_fd_of_the_wrong_kind() {
-    let got = exit_code(in_child(|| {
+    let declared = |mode: Mode, kind: Kind, make: fn() -> RawFd| {
+        exit_code(in_child(move || {
+            let fd = make();
+            let f = arrange(&[fd]);
+            verdict(unsharek_tcb::lockdown(Config::new(gate_ip()).mode(mode).grant_as(kind, [f.get(fd).unwrap()]), &[]).map(|()| f))
+        }))
+    };
+    let file = || {
         let (f, _) = temp_file();
         let fd = f.as_raw_fd();
         std::mem::forget(f);
-        verdict(lockdown(&Guest { fds: vec![eventfd(), fd], mode: Mode::Threaded }, |_| ()))
-    }));
-    assert_eq!(got, 2);
-    let got = exit_code(in_child(|| {
+        fd
+    };
+    let pipe = || {
         let mut p = [0; 2];
         // SAFETY: a pipe.
         assert_eq!(unsafe { libc::pipe(p.as_mut_ptr()) }, 0);
-        verdict(lockdown(&Guest { fds: vec![p[1]], mode: Mode::Threaded }, |_| ()))
-    }));
-    assert_eq!(got, 2);
-    let got = exit_code(in_child(|| {
-        // SAFETY: a pidfd of this process.
-        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) } as RawFd;
-        verdict(lockdown(&Guest { fds: vec![eventfd(), pidfd], mode: Mode::Fork }, |_| ()))
-    }));
-    assert_eq!(got, 0);
-    // A pidfd outside fork mode: refused (only fork mode's processes poll init's).
-    let got = exit_code(in_child(|| {
-        // SAFETY: a pidfd of this process.
-        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) } as RawFd;
-        verdict(lockdown(&Guest { fds: vec![pidfd], mode: Mode::Threaded }, |_| ()))
-    }));
-    assert_eq!(got, 2);
+        p[1]
+    };
+    assert_eq!(declared(Mode::Threaded, Kind::Eventfd, file), 2, "a file");
+    assert_eq!(declared(Mode::Threaded, Kind::Eventfd, pipe), 2, "a pipe");
+    assert_eq!(declared(Mode::Threaded, Kind::Eventfd, eventfd), 0, "an eventfd");
+    assert_eq!(declared(Mode::Fork, Kind::Pidfd, pidfd), 0, "a pidfd");
 }
 
 /// A second thread: refused, its tid named. Lockdown is then no further than step 1.
@@ -494,7 +497,7 @@ fn refuses_a_closed_grant() {
     let got = exit_code(in_child(|| {
         // SAFETY: closes fd 3, this process's.
         unsafe { libc::close(3) };
-        match unsharek_tcb::lockdown(Config::new().grant([0, 1, 2, 3]).gate(gate_ip()), &[]) {
+        match unsharek_tcb::lockdown(Config::new(gate_ip()).grant([0, 1, 2, 3]), &[]) {
             Err(Error::NotOpen(3)) => 0,
             _ => 1,
         }
@@ -516,7 +519,7 @@ fn refuses_a_gap() {
             assert_eq!(libc::dup2(p[1], 4), 4);
             libc::close(3);
         }
-        match unsharek_tcb::lockdown(Config::new().grant([0, 1, 2, 4]).gate(gate_ip()), &[]) {
+        match unsharek_tcb::lockdown(Config::new(gate_ip()).grant([0, 1, 2, 4]), &[]) {
             Err(Error::Gap { gap: 3, n: 4 }) => 0,
             _ => 1,
         }
@@ -534,7 +537,7 @@ fn closes_fds_at_or_above_n() {
         assert_eq!(unsafe { libc::pipe(p.as_mut_ptr()) }, 0);
         // SAFETY: dup of this process's fd far above.
         let stray = unsafe { libc::dup2(p[0], 700) };
-        let Ok(f) = lockdown(&Guest { fds: vec![], mode: Mode::Coroutine }, |s| s.fds.extend([p[0], p[1]])) else {
+        let Ok(f) = lockdown(&Guest { fds: vec![], mode: Mode::Coroutine }, |s| s.extend([p[0], p[1]])) else {
             return 1;
         };
         let (r, w) = (f.get(p[0]).unwrap(), f.get(p[1]).unwrap());
@@ -615,7 +618,7 @@ fn refuses_a_process_sharing_the_memory() {
                 libc::clone(sharer, stack.as_mut_ptr().add(stack.len()) as *mut _, libc::CLONE_VM | libc::SIGCHLD, std::ptr::null_mut())
             };
             assert!(pid > 0);
-            let c = Config::new().mode(Mode::Coroutine).gate(gate_ip()).paranoia(paranoia);
+            let c = Config::new(gate_ip()).mode(Mode::Coroutine).paranoia(paranoia);
             let r = unsharek_tcb::lockdown(c, &[]);
             let out = match r {
                 Err(Error::Paranoia(m)) if m.contains(&pid.to_string()) => 0,
@@ -647,10 +650,10 @@ fn refuses_a_process_sharing_the_memory() {
     }
 }
 
-/// Paranoia refuses a kept fd no caller can mean: another process's memory (/proc/<pid>/mem),
-/// a writable /proc file. A read-only /proc file passes.
+/// A kept fd no caller can mean is refused, always (not paranoia): another process's memory
+/// (/proc/<pid>/mem), a writable /proc file. A read-only /proc file passes.
 #[test]
-fn paranoia_refuses_kernel_fds() {
+fn refuses_kernel_fds() {
     for (path, write, want) in [("/proc/self/mem", false, 0), ("/proc/self/attr/current", true, 0), ("/proc/self/stat", false, 1)] {
         let code = exit_code(in_child(|| {
             let Ok(f) = std::fs::OpenOptions::new().read(!write).write(write).open(path) else {
@@ -658,8 +661,8 @@ fn paranoia_refuses_kernel_fds() {
             };
             let fd = f.as_raw_fd();
             std::mem::forget(f);
-            match lockdown(&Guest { fds: vec![], mode: Mode::Coroutine }, |s| s.fds.extend([fd])) {
-                Err(Error::Paranoia(_)) => 0,
+            match lockdown(&Guest { fds: vec![], mode: Mode::Coroutine }, |s| s.extend([fd])) {
+                Err(Error::FdKind { .. }) => 0,
                 Ok(_) => 1,
                 Err(_) => 2,
             }
@@ -668,22 +671,26 @@ fn paranoia_refuses_kernel_fds() {
     }
 }
 
-/// How long lockdown's checks take (`--nocapture` prints them): the paranoia check, and the
-/// rest (threads, fds, mappings).
+/// How long lockdown's checks take (`--nocapture` prints them, with `--features testing`): the
+/// paranoia check, the fd checks (for about 140 kept fds: stdio and threaded mode's CPU tokens
+/// and more), and all of steps 1-3 (threads, fds, mappings).
+#[cfg(feature = "testing")]
 #[test]
 fn check_times() {
-    for mode in [Mode::Coroutine, Mode::Fork] {
+    for (mode, extra) in [(Mode::Coroutine, 0), (Mode::Threaded, 136), (Mode::Fork, 0)] {
         let code = exit_code(in_child(|| {
             if mode == Mode::Fork {
                 map(-1, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED | libc::MAP_ANONYMOUS);
             }
+            let tokens: Vec<RawFd> = (0..extra).map(|_| eventfd()).collect();
             // Allocated before: after lockdown no memory call goes through.
             let mut m = String::with_capacity(256);
-            let Ok(f) = lockdown(&Guest { fds: vec![], mode }, |s| s.fds.extend([0, 1, 2])) else {
+            let Ok(f) = lockdown(&Guest { fds: tokens, mode }, |s| s.extend([0, 1, 2])) else {
                 return 1;
             };
+            let (checks, fds, paranoia) = unsharek_tcb::times_ns();
             use std::fmt::Write;
-            let _ = writeln!(m, "{mode:?}: paranoia {} us, checks {} us", unsharek_tcb::paranoia_ns() / 1000, unsharek_tcb::check_ns() / 1000);
+            let _ = writeln!(m, "{mode:?}, {} fds: paranoia {} us, threads and fds {} us ({} ns a fd), checks {} us", f.n, paranoia / 1000, fds / 1000, fds / f.n as u64, checks / 1000);
             g(libc::SYS_write, [f.get(2).unwrap() as usize, m.as_ptr() as usize, m.len()]);
             0
         }));
@@ -708,7 +715,7 @@ fn fs_roots_are_confined() {
     let c = |p: &std::path::Path| std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
     let (inside, outside, new) = (c(&root.join("in")), c(&out.join("x")), c(&root.join("new")));
     let nb = (libc::O_NONBLOCK | libc::O_CLOEXEC) as usize;
-    for access in [unsharek_tcb::Fs::ReadOnly, unsharek_tcb::Fs::ReadWrite] {
+    for access in [Fs::ReadOnly, Fs::ReadWrite] {
         let code = exit_code(in_child(|| {
             let Ok(f) = with_plugins(&Guest { fds: vec![], mode: Mode::Coroutine }, |_| (), &[&Files::new().root(&root, access)]) else {
                 return 1;
@@ -722,7 +729,7 @@ fn fs_roots_are_confined() {
             if g(libc::SYS_openat, [n, outside.as_ptr() as usize, nb]) != -(libc::EACCES as isize) {
                 return 3;
             }
-            if access == unsharek_tcb::Fs::ReadWrite {
+            if access == Fs::ReadWrite {
                 // SAFETY: openat from the gate, with a mode.
                 let w = unsafe { gate(libc::SYS_openat as usize, n, new.as_ptr() as usize, nb | (libc::O_CREAT | libc::O_WRONLY) as usize, 0o644, 0, 0) };
                 if w < n as isize || g(libc::SYS_write, [w as usize, b.as_ptr() as usize, 2]) != 2 {
@@ -738,7 +745,7 @@ fn fs_roots_are_confined() {
             0
         }));
         assert_eq!(code, 0, "{access:?}");
-        if access == unsharek_tcb::Fs::ReadWrite {
+        if access == Fs::ReadWrite {
             assert_eq!(std::fs::read(root.join("new")).unwrap(), b"in");
         }
     }
@@ -749,7 +756,7 @@ fn fs_roots_are_confined() {
 #[test]
 fn fs_read_only_refuses_a_write_open() {
     let status = in_child(|| {
-        let Ok(f) = with_plugins(&Guest { fds: vec![], mode: Mode::Coroutine }, |_| (), &[&Files::new().root("/", unsharek_tcb::Fs::ReadOnly)]) else {
+        let Ok(f) = with_plugins(&Guest { fds: vec![], mode: Mode::Coroutine }, |_| (), &[&Files::new().root("/", Fs::ReadOnly)]) else {
             return 1;
         };
         g(libc::SYS_openat, [f.n as usize, c"/tmp/x".as_ptr() as usize, (libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) as usize]);
@@ -805,7 +812,7 @@ fn net_sockets_work() {
 #[test]
 fn fs_without_landlock() {
     let code = exit_code(in_child(|| {
-        let Ok(f) = with_plugins(&Guest { fds: vec![], mode: Mode::Coroutine }, |_| (), &[&Files::new().root("/nonexistent-root", unsharek_tcb::Fs::ReadOnly).no_landlock(true)]) else {
+        let Ok(f) = with_plugins(&Guest { fds: vec![], mode: Mode::Coroutine }, |_| (), &[&Files::new().root("/nonexistent-root", Fs::ReadOnly).no_landlock(true)]) else {
             return 1;
         };
         let fd = g(libc::SYS_openat, [f.n as usize, c"/proc/version".as_ptr() as usize, (libc::O_NONBLOCK | libc::O_CLOEXEC) as usize]);
@@ -835,34 +842,27 @@ fn paranoia_refuses_inherited_shared_memory() {
     assert_eq!(code, 0);
 }
 
-/// The guest's fds are exactly the mode's: coroutine mode none (an eventfd or a pidfd refused);
-/// threaded mode TOKEN_FDS eventfds (one fewer or more refused, a pidfd refused); fork mode those
-/// and one pidfd (none, or two, refused).
+/// The mode's own kinds: an eventfd only in threaded and fork mode, a pidfd only in fork mode
+/// (declared so: a kind rule, not a count); a fd declared one that isn't is refused too.
 #[test]
-fn guest_fds_are_the_modes() {
-    use unsharek_tcb::TOKEN_FDS;
-    let refused = |mode: Mode, fds: fn() -> Vec<RawFd>| {
+fn kinds_are_the_modes() {
+    let run = |mode: Mode, kind: Kind, make: fn() -> RawFd| {
         exit_code(in_child(move || {
-            let fds = fds();
-            let f = arrange(&fds);
-            let c = Config::new().mode(mode).guest_fds(fds.iter().map(|&fd| f.get(fd).unwrap())).gate(gate_ip());
-            match unsharek_tcb::lockdown(c, &[]) {
-                Err(Error::GuestFds { .. } | Error::FdKind { .. }) => 0,
-                Ok(_) => 1,
-                Err(_) => 2,
+            let fd = make();
+            let f = arrange(&[0, 1, 2, fd]);
+            match unsharek_tcb::lockdown(Config::new(gate_ip()).mode(mode).grant([0, 1, 2]).grant_as(kind, [f.get(fd).unwrap()]), &[]) {
+                Ok(_) => 0,
+                Err(Error::ModeKind { .. }) => 1,
+                Err(Error::FdKind { .. }) => 2,
+                Err(_) => 3,
             }
         }))
     };
-    assert_eq!(refused(Mode::Coroutine, || vec![eventfd()]), 0, "coroutine: an eventfd");
-    assert_eq!(refused(Mode::Coroutine, || vec![pidfd()]), 0, "coroutine: a pidfd");
-    assert_eq!(refused(Mode::Threaded, || (0..TOKEN_FDS - 1).map(|_| eventfd()).collect()), 0, "threaded: one token short");
-    assert_eq!(refused(Mode::Threaded, || (0..TOKEN_FDS + 1).map(|_| eventfd()).collect()), 0, "threaded: one token more");
-    assert_eq!(refused(Mode::Threaded, || { let mut v: Vec<RawFd> = (0..TOKEN_FDS).map(|_| eventfd()).collect(); v.push(pidfd()); v }), 0, "threaded: a pidfd");
-    assert_eq!(refused(Mode::Fork, || (0..TOKEN_FDS).map(|_| eventfd()).collect()), 0, "fork: no pidfd");
-    assert_eq!(refused(Mode::Fork, || { let mut v: Vec<RawFd> = (0..TOKEN_FDS).map(|_| eventfd()).collect(); v.extend([pidfd(), pidfd()]); v }), 0, "fork: two pidfds");
-    // The mode's exact set passes.
-    for mode in [Mode::Coroutine, Mode::Threaded, Mode::Fork] {
-        let code = exit_code(in_child(|| verdict(lockdown(&Guest { fds: vec![], mode }, |_| ()))));
-        assert_eq!(code, 0, "{mode:?}: the mode's own");
-    }
+    assert_eq!(run(Mode::Coroutine, Kind::Eventfd, eventfd), 1, "coroutine: an eventfd");
+    assert_eq!(run(Mode::Coroutine, Kind::Pidfd, pidfd), 1, "coroutine: a pidfd");
+    assert_eq!(run(Mode::Threaded, Kind::Pidfd, pidfd), 1, "threaded: a pidfd");
+    assert_eq!(run(Mode::Threaded, Kind::Eventfd, eventfd), 0, "threaded: an eventfd");
+    assert_eq!(run(Mode::Fork, Kind::Pidfd, pidfd), 0, "fork: a pidfd");
+    assert_eq!(run(Mode::Threaded, Kind::Eventfd, pidfd), 2, "threaded: a pidfd declared an eventfd");
+    assert_eq!(run(Mode::Fork, Kind::Pidfd, eventfd), 2, "fork: an eventfd declared a pidfd");
 }

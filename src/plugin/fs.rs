@@ -18,7 +18,7 @@ use libc::{SECCOMP_RET_ALLOW, SECCOMP_RET_KILL_PROCESS};
 use rustix::fs::{Mode as FsMode, OFlags};
 
 use super::{Plugin, Rows};
-use crate::{Error, Fs, Result};
+use crate::{Error, Result};
 
 // Flags the rows compare with, libc's, as u64 (the registers' width).
 const O_RDONLY: u64 = libc::O_RDONLY as u64;
@@ -45,6 +45,19 @@ const RENAME_EXCHANGE: u64 = 2;
 /// The largest fd (the kernel's `int`): an fd condition's upper bound, so that no high bit of the
 /// 64-bit register turns a refused number into another (the kernel reads 32 bits).
 const INT_MAX: u64 = i32::MAX as u64;
+
+/// A file plugin's access ([`Files::root`]): which rows the filter has, and which rights
+/// Landlock gives a root.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Fs {
+    /// No file plugin: no row opens a file.
+    #[default]
+    Off,
+    /// Reading files and directories under the roots: no call that changes one.
+    ReadOnly,
+    /// Reading, writing, making and removing them.
+    ReadWrite,
+}
 
 /// The file plugin: roots, each read-only or read-write, confined by Landlock.
 #[derive(Clone, Debug, Default)]
@@ -120,7 +133,7 @@ impl Plugin for Files {
 
 /// The rows: ALLOW, or KILL_PROCESS for no match (the composition, `super::policy`, reads any
 /// verdict but ALLOW as none). `n` is the floor; `writes` the read-write rows.
-pub(super) fn policy(n: u64, writes: bool) -> impl Fn(&seccomp_data) -> u32 {
+pub(crate) fn policy(n: u64, writes: bool) -> impl Fn(&seccomp_data) -> u32 {
     move |d| {
         match d.nr as i64 {
             // The close of an fd this plugin opened, never a kept one (the guest answers that).
@@ -211,7 +224,7 @@ pub(super) fn policy(n: u64, writes: bool) -> impl Fn(&seccomp_data) -> u32 {
 }
 
 /// [`policy`]'s program.
-pub(super) fn filter(n: u64, writes: bool) -> Vec<sock_filter> {
+pub(crate) fn filter(n: u64, writes: bool) -> Vec<sock_filter> {
     seccomp_fn::bpf!(policy(n, writes))
 }
 

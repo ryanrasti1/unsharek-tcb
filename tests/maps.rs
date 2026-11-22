@@ -1,3 +1,4 @@
+#![cfg(feature = "testing")] // map_ok is a test hook
 //! Lockdown's mapping rule, line by line: private anything; shared only read-only, or in fork mode
 //! anonymous (the kernel's shmem); never a writable shared mapping of a file, a memfd or SysV shm.
 

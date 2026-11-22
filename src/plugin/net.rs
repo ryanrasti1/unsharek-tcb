@@ -36,7 +36,7 @@ pub struct Net;
 
 impl Net {
     /// The most pollfds one `ppoll` may pass with this plugin (the guest's sockets; the core's
-    /// own bound is `Config::ppoll_max`).
+    /// own is `crate::PPOLL_FDS`).
     pub const PPOLL_FDS: u64 = 4096;
 }
 
@@ -48,7 +48,7 @@ impl Plugin for Net {
 
 /// The rows: ALLOW, or KILL_PROCESS for no match (the composition, `super::policy`, reads any
 /// verdict but ALLOW as none). `n` is the floor.
-pub(super) fn policy(n: u64) -> impl Fn(&seccomp_data) -> u32 {
+pub(crate) fn policy(n: u64) -> impl Fn(&seccomp_data) -> u32 {
     move |d| {
         match d.nr as i64 {
             // Readiness of up to `Net::PPOLL_FDS` fds (the guest's sockets); no signal mask (it
@@ -124,6 +124,6 @@ pub(super) fn policy(n: u64) -> impl Fn(&seccomp_data) -> u32 {
 }
 
 /// [`policy`]'s program.
-pub(super) fn filter(n: u64) -> Vec<sock_filter> {
+pub(crate) fn filter(n: u64) -> Vec<sock_filter> {
     seccomp_fn::bpf!(policy(n))
 }
