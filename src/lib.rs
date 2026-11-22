@@ -17,7 +17,7 @@
 //!     .grant([0, 1, 2])      // kept, read and write only
 //!     .guest_fds([token_fd]) // the guest's own: kind-checked
 //!     .gate(gate);           // the one instruction host calls may come from
-//! let fds = lockdown(c)?;    // the kept fds, renumbered 0..n
+//! let fds = lockdown(c, &[])?; // the kept fds, renumbered 0..n; no plugins
 //! let token_fd = fds.get(token_fd).unwrap();
 //! // Locked down: run the program.
 //! # Ok::<(), unsharek_tcb::Error>(())
@@ -61,11 +61,15 @@ use std::os::fd::RawFd;
 
 mod filter;
 mod lockdown;
+pub mod plugin;
 
 pub use filter::{
-    AUDIT_ARCH_X86_64, CLONE_THREAD_FLAGS, PPOLL_FDS, PPOLL_NET_FDS, SECCOMP_RET_ALLOW as RET_ALLOW, SECCOMP_RET_KILL_PROCESS as RET_KILL_PROCESS,
-    SECCOMP_RET_TRAP as RET_TRAP, X32_SYSCALL_BIT, filter, policy,
+    AUDIT_ARCH_X86_64, CLONE_THREAD_FLAGS, NO_MATCH, PPOLL_FDS, SECCOMP_RET_ALLOW as RET_ALLOW, SECCOMP_RET_KILL_PROCESS as RET_KILL_PROCESS,
+    SECCOMP_RET_TRAP as RET_TRAP, X32_SYSCALL_BIT,
 };
+pub use plugin::{Plugin, filter, policy};
+/// [`plugin::Net::PPOLL_FDS`].
+pub const PPOLL_NET_FDS: u64 = plugin::Net::PPOLL_FDS;
 pub use libc::{seccomp_data, sock_filter};
 #[doc(hidden)]
 pub use lockdown::{check_ns, map_ok, paranoia_ns};
@@ -86,7 +90,7 @@ pub enum Mode {
     Fork,
 }
 
-/// A file plugin's access ([`Config::fs_root`]): which rows the filter has, and which rights
+/// A file plugin's access ([`plugin::Files::root`]): which rows the filter has, and which rights
 /// Landlock gives a root.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Fs {
@@ -125,22 +129,13 @@ pub struct Config {
     pub gate: Option<u64>,
     /// The most pollfds one `ppoll` may pass: at least what the guest waits on at once.
     pub ppoll_max: u64,
-    /// Plugin: fs. The roots the program may reach by path, each with its access
-    /// ([`Config::fs_root`]).
-    pub fs_roots: Vec<(std::path::PathBuf, Fs)>,
-    /// Plugin: fs. Install the fs rows without Landlock ([`Config::no_landlock`]): only where the
-    /// process's file access is already scoped by something else (a container's own
-    /// filesystem), since then the rows reach every file the process can.
-    pub no_landlock: bool,
-    /// Plugin: net. IPv4 and IPv6 TCP and UDP sockets ([`Config::net`]).
-    pub net: bool,
     /// The best-effort check of lockdown's assumptions ([`Config::paranoia`]). On by default.
     pub paranoia: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { mode: Mode::default(), fds: vec![], guest_fds: vec![], gate: None, ppoll_max: PPOLL_FDS, fs_roots: vec![], no_landlock: false, net: false, paranoia: true }
+        Config { mode: Mode::default(), fds: vec![], guest_fds: vec![], gate: None, ppoll_max: PPOLL_FDS, paranoia: true }
     }
 }
 
@@ -184,44 +179,6 @@ impl Config {
         self
     }
 
-    /// Plugin: fs. The program may reach `root` and what is under it, by path, with `access`
-    /// (not [`Fs::Off`]): the filter gets the fs rows (read-only ones if every root is
-    /// read-only), and lockdown applies a Landlock ruleset, just before the filter, that allows
-    /// exactly the roots (read-only: reading files and directories; read-write: also writing,
-    /// truncating, making and removing files, directories and symlinks, and renaming between
-    /// roots; never a device, FIFO or socket node made, and no device ioctl where the kernel's
-    /// Landlock has the right). Lockdown refuses if the kernel has no Landlock, or not the
-    /// rights the access needs ([`Config::no_landlock`]).
-    pub fn fs_root(mut self, root: impl Into<std::path::PathBuf>, access: Fs) -> Self {
-        if access != Fs::Off {
-            self.fs_roots.push((root.into(), access));
-        }
-        self
-    }
-
-    /// Plugin: fs. The opt-out of Landlock: the fs rows go in without a ruleset, and the roots
-    /// confine nothing. Only for a process whose file access is already scoped (a container's
-    /// own filesystem); without it lockdown refuses the fs rows on a kernel without Landlock
-    /// (or where a seccomp profile hides it: ENOSYS, EPERM), or whose Landlock lacks a right
-    /// the access needs (read-write: `REFER`, ABI 2, and `TRUNCATE`, ABI 3).
-    pub fn no_landlock(mut self, on: bool) -> Self {
-        self.no_landlock = on;
-        self
-    }
-
-    /// The file plugin's rows: the widest access of the roots.
-    pub fn fs(&self) -> Fs {
-        self.fs_roots.iter().map(|r| r.1).max().unwrap_or(Fs::Off)
-    }
-
-    /// Plugin: net. The filter gets the socket rows: IPv4 and IPv6 TCP and UDP, to any address
-    /// (the network namespace the caller runs the process in is what confines it), and `ppoll`
-    /// on up to [`PPOLL_NET_FDS`] fds.
-    pub fn net(mut self, on: bool) -> Self {
-        self.net = on;
-        self
-    }
-
     /// Whether lockdown first checks its assumptions, best-effort (the crate's "Assumptions":
     /// another process sharing the memory, a tracer, shared memory another process maps, a
     /// grant of a kind that can't be meant). On by default; off saves its time
@@ -256,7 +213,7 @@ pub enum Error {
     Mapping(String),
     /// The paranoia check ([`Config::paranoia`]) found an assumption broken.
     Paranoia(String),
-    /// Landlock (for [`Config::fs_root`]): unavailable, or a root it couldn't take.
+    /// Landlock (for [`plugin::Files`]): unavailable, or a root it couldn't take.
     Landlock(String),
     /// A capability lockdown couldn't drop.
     Capabilities(String),
@@ -336,8 +293,13 @@ impl Fds {
 ///    host write none of the process's memory, nor start `core_pattern`'s helper;
 /// 6. every capability dropped (bounding where permitted, ambient, effective, permitted,
 ///    inheritable);
-/// 7. `no_new_privs`, and with [`Config::fs_root`] the Landlock ruleset of the roots;
-/// 8. the filter ([`filter`], its floor `n`), with TSYNC (redundant after step 1, kept).
+/// 7. `no_new_privs`, then each plugin's [`Plugin::setup`] (the file plugin's Landlock ruleset of
+///    its roots);
+/// 8. the filter ([`filter`]: the core's rows, then the plugins', its floor `n`), with TSYNC
+///    (redundant after step 1, kept).
+///
+/// `plugins` (experimental) widen the sandbox, each only when passed ([`plugin`]): their
+/// [`Plugin::check`]s run first, before anything changes; their kept fds are kept as grants are.
 ///
 /// A caller that wants more restrictions installs its own seccomp filter before this: filters
 /// stack, the strictest answer wins (it must let lockdown's own calls through).
@@ -345,8 +307,8 @@ impl Fds {
 /// On success the process is locked down ([`locked_down`]); the caller uses the kept fds' new
 /// numbers ([`Fds::get`]) and hands over to the program. On failure nothing untrusted has run
 /// (the fds may have been renumbered already: the caller reports the error and ends).
-pub fn lockdown(config: Config) -> Result<Fds> {
-    let fds = lockdown::lockdown(config)?;
+pub fn lockdown(config: Config, plugins: &[&dyn Plugin]) -> Result<Fds> {
+    let fds = lockdown::lockdown(config, plugins)?;
     LOCKED.store(true, std::sync::atomic::Ordering::SeqCst);
     Ok(fds)
 }

@@ -6,6 +6,7 @@
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
+use unsharek_tcb::plugin::{Files, Net};
 use unsharek_tcb::{Config, Error, Fds, Mode};
 
 // ------------------------------------------------------------------------------------------------
@@ -100,9 +101,14 @@ struct Guest {
 
 /// Lockdown for `guest`, in its mode, with the grants `grants` makes.
 fn lockdown(guest: &Guest, grants: impl FnOnce(&mut Config)) -> unsharek_tcb::Result<Fds> {
+    with_plugins(guest, grants, &[])
+}
+
+/// [`lockdown`], with `plugins`.
+fn with_plugins(guest: &Guest, grants: impl FnOnce(&mut Config), plugins: &[&dyn unsharek_tcb::Plugin]) -> unsharek_tcb::Result<Fds> {
     let mut c = Config::new().mode(guest.mode).guest_fds(mode_fds(guest.mode, &guest.fds)).gate(gate_ip());
     grants(&mut c);
-    unsharek_tcb::lockdown(c)
+    unsharek_tcb::lockdown(c, plugins)
 }
 
 /// `fds` and what the mode keeps besides: threaded and fork mode's TOKEN_FDS eventfds (`fds`'
@@ -653,7 +659,7 @@ fn refuses_a_process_sharing_the_memory() {
             };
             assert!(pid > 0);
             let c = Config::new().mode(Mode::Coroutine).gate(gate_ip()).paranoia(paranoia);
-            let r = unsharek_tcb::lockdown(c);
+            let r = unsharek_tcb::lockdown(c, &[]);
             let out = match r {
                 Err(Error::Paranoia(m)) if m.contains(&pid.to_string()) => 0,
                 Ok(_) => 1,
@@ -747,7 +753,7 @@ fn fs_roots_are_confined() {
     let nb = (libc::O_NONBLOCK | libc::O_CLOEXEC) as usize;
     for access in [unsharek_tcb::Fs::ReadOnly, unsharek_tcb::Fs::ReadWrite] {
         let code = exit_code(in_child(|| {
-            let Ok(f) = lockdown(&Guest { fds: vec![], mode: Mode::Coroutine }, |s| *s = s.clone().fs_root(&root, access)) else {
+            let Ok(f) = with_plugins(&Guest { fds: vec![], mode: Mode::Coroutine }, |_| (), &[&Files::new().root(&root, access)]) else {
                 return 1;
             };
             let n = f.n as usize;
@@ -786,7 +792,7 @@ fn fs_roots_are_confined() {
 #[test]
 fn fs_read_only_refuses_a_write_open() {
     let status = in_child(|| {
-        let Ok(f) = lockdown(&Guest { fds: vec![], mode: Mode::Coroutine }, |s| *s = s.clone().fs_root("/", unsharek_tcb::Fs::ReadOnly)) else {
+        let Ok(f) = with_plugins(&Guest { fds: vec![], mode: Mode::Coroutine }, |_| (), &[&Files::new().root("/", unsharek_tcb::Fs::ReadOnly)]) else {
             return 1;
         };
         g(libc::SYS_openat, [f.n as usize, c"/tmp/x".as_ptr() as usize, (libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) as usize]);
@@ -799,7 +805,7 @@ fn fs_read_only_refuses_a_write_open() {
 #[test]
 fn net_sockets_work() {
     let code = exit_code(in_child(|| {
-        let Ok(_) = lockdown(&Guest { fds: vec![], mode: Mode::Coroutine }, |s| *s = s.clone().net(true)) else {
+        let Ok(_) = with_plugins(&Guest { fds: vec![], mode: Mode::Coroutine }, |_| (), &[&Net]) else {
             return 1;
         };
         let st = (libc::SOCK_STREAM | libc::SOCK_CLOEXEC) as usize;
@@ -842,7 +848,7 @@ fn net_sockets_work() {
 #[test]
 fn fs_without_landlock() {
     let code = exit_code(in_child(|| {
-        let Ok(f) = lockdown(&Guest { fds: vec![], mode: Mode::Coroutine }, |s| *s = s.clone().fs_root("/nonexistent-root", unsharek_tcb::Fs::ReadOnly).no_landlock(true)) else {
+        let Ok(f) = with_plugins(&Guest { fds: vec![], mode: Mode::Coroutine }, |_| (), &[&Files::new().root("/nonexistent-root", unsharek_tcb::Fs::ReadOnly).no_landlock(true)]) else {
             return 1;
         };
         let fd = g(libc::SYS_openat, [f.n as usize, c"/proc/version".as_ptr() as usize, (libc::O_NONBLOCK | libc::O_CLOEXEC) as usize]);
@@ -881,7 +887,7 @@ fn guest_fds_are_the_modes() {
     let refused = |mode: Mode, fds: fn() -> Vec<RawFd>| {
         exit_code(in_child(move || {
             let c = Config::new().mode(mode).guest_fds(fds()).gate(gate_ip());
-            match unsharek_tcb::lockdown(c) {
+            match unsharek_tcb::lockdown(c, &[]) {
                 Err(Error::GuestFds { .. } | Error::FdKind { .. }) => 0,
                 Ok(_) => 1,
                 Err(_) => 2,

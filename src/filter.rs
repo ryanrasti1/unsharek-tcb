@@ -1,73 +1,33 @@
-//! The filter: which host syscalls the process may make after lockdown, each argument pinned.
-//! [`policy`] is the whole of it, as a plain Rust function of a call (`d`) and the [`Config`]'s
-//! mode, fd floor and `ppoll_max`, and the gate's address; `seccomp_fn::bpf!`
-//! compiles it to classic BPF ([`filter`]), and Kani proves the program gives the function's
-//! verdict on every call, for every mode, floor, bound and gate (`cargo kani`:
-//! seccomp-fn-verify's harnesses, `filter::proof::*`). The compiler isn't
-//! trusted: the proof checks its output.
-//! [`crate::lockdown`] installs it.
+//! The core filter: which host syscalls the process may make after lockdown, each argument
+//! pinned, without any plugin. [`policy`] is the whole of it, as a plain Rust function of a call
+//! (`d`) and the [`crate::Config`]'s mode, fd floor and `ppoll_max`, and the gate's address;
+//! `seccomp_fn::bpf!` compiles it to classic BPF ([`filter`]). The installed filter is this one
+//! composed with the enabled plugins' rows (`crate::plugin::{policy, filter}`), and Kani proves
+//! that program gives the composed function's verdict on every call, for every mode, plugin
+//! choice, floor, bound and gate (`cargo kani`: `plugin::proof::*`). The compiler isn't trusted:
+//! the proof checks its output. [`crate::lockdown`] installs it.
 //!
 //! **Shape.** 1. Another arch, or the x32 bit: KILL_PROCESS (the rows know only x86-64 numbers,
 //! and must not judge another ABI's). 2. Not from the gate ([`crate::Config::gate`]): TRAP,
 //! the program's call, served in-process by the runtime's SIGSYS handler; every thread and
 //! process made after lockdown inherits the filter, so this is how all of them are served. The
 //! gate's address is the guest's value, which a reviewer needn't trust: this check returns only
-//! TRAP and KILL. 3. README.md's table, row by row: ALLOW, or KILL_PROCESS.
-//! There is one filter; no `prctl`, `seccomp` or syscall-user-dispatch rule is in it.
+//! TRAP and KILL. 3. README.md's core table, row by row: ALLOW, or [`NO_MATCH`] (the plugins'
+//! turn, and then KILL_PROCESS). There is one filter; no `prctl`, `seccomp` or
+//! syscall-user-dispatch rule is in it.
 #![allow(non_upper_case_globals)] // libc's syscall names, as patterns
 
 use libc::{seccomp_data, sock_filter};
 
-use crate::{Fs, Mode};
+use crate::Mode;
 
 // The policy's syscalls, libc's.
-use libc::{
-    SYS_accept4, SYS_bind, SYS_clone, SYS_close, SYS_connect, SYS_exit, SYS_exit_group, SYS_fchmodat,
-    SYS_fstat, SYS_fsync, SYS_ftruncate, SYS_getdents64,
-    SYS_getpeername, SYS_getsockname, SYS_getsockopt, SYS_listen, SYS_mkdirat,
-    SYS_openat, SYS_ppoll, SYS_pread64, SYS_pwrite64, SYS_read, SYS_readlinkat, SYS_renameat2,
-    SYS_rt_sigreturn, SYS_setsockopt, SYS_shutdown, SYS_socket, SYS_symlinkat, SYS_unlinkat,
-    SYS_utimensat, SYS_write,
-};
+use libc::{SYS_clone, SYS_exit, SYS_exit_group, SYS_ppoll, SYS_read, SYS_rt_sigreturn, SYS_write};
 pub use libc::{SECCOMP_RET_ALLOW, SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_TRAP};
-// Flags the rows compare with, libc's, as u64 (the registers' width).
-const O_RDONLY: u64 = libc::O_RDONLY as u64;
-const O_WRONLY: u64 = libc::O_WRONLY as u64;
-const O_RDWR: u64 = libc::O_RDWR as u64;
-const O_CREAT: u64 = libc::O_CREAT as u64;
-const O_EXCL: u64 = libc::O_EXCL as u64;
-const O_TRUNC: u64 = libc::O_TRUNC as u64;
-const O_APPEND: u64 = libc::O_APPEND as u64;
-const O_NONBLOCK: u64 = libc::O_NONBLOCK as u64;
-const O_DIRECTORY: u64 = libc::O_DIRECTORY as u64;
-const O_NOFOLLOW: u64 = libc::O_NOFOLLOW as u64;
-const O_CLOEXEC: u64 = libc::O_CLOEXEC as u64;
-/// Every `openat`'s: nonblocking (a FIFO or a device must not block the open), close-on-exec.
-const O_NB: u64 = O_NONBLOCK | O_CLOEXEC;
-const AT_SYMLINK_NOFOLLOW: u64 = libc::AT_SYMLINK_NOFOLLOW as u64;
-const AT_REMOVEDIR: u64 = libc::AT_REMOVEDIR as u64;
-const AF_INET: u64 = libc::AF_INET as u64;
-const AF_INET6: u64 = libc::AF_INET6 as u64;
-const SOCK_STREAM: u64 = libc::SOCK_STREAM as u64;
-const SOCK_DGRAM: u64 = libc::SOCK_DGRAM as u64;
-const SOCK_NONBLOCK: u64 = libc::SOCK_NONBLOCK as u64;
-const SOCK_CLOEXEC: u64 = libc::SOCK_CLOEXEC as u64;
-const SOL_SOCKET: u64 = libc::SOL_SOCKET as u64;
-const SO_REUSEADDR: u64 = libc::SO_REUSEADDR as u64;
-const SO_KEEPALIVE: u64 = libc::SO_KEEPALIVE as u64;
-const SO_ERROR: u64 = libc::SO_ERROR as u64;
-const IPPROTO_TCP: u64 = libc::IPPROTO_TCP as u64;
-const TCP_NODELAY: u64 = libc::TCP_NODELAY as u64;
-const IPPROTO_IPV6: u64 = libc::IPPROTO_IPV6 as u64;
-const IPV6_V6ONLY: u64 = libc::IPV6_V6ONLY as u64;
-/// A created file's or directory's mode, or a new one: below `S_ISGID` (0o2000), so neither it
-/// nor `S_ISUID` (the sticky bit may be).
-const MODE_MAX: u64 = 0o1777;
-/// include/uapi/linux/fs.h's `RENAME_EXCHANGE` (libc has it for glibc only): with 0 and
-/// `RENAME_NOREPLACE` (1) the flags `renameat2` may have; `RENAME_WHITEOUT` is 4.
-const RENAME_EXCHANGE: u64 = 2;
-/// With the net plugin, the most pollfds one `ppoll` may pass (the guest's sockets).
-pub const PPOLL_NET_FDS: u64 = 4096;
+/// The core's "none of my rows": never installed (the composition, `crate::plugin::filter`,
+/// turns each into the plugins' turn, then KILL_PROCESS). `SECCOMP_RET_KILL_THREAD`'s value, so
+/// a program that still had one would fail closed.
+pub const NO_MATCH: u32 = libc::SECCOMP_RET_KILL_THREAD;
 // Not in libc for x86_64:
 /// include/uapi/linux/audit.h: `AUDIT_ARCH_X86_64 = EM_X86_64 | __AUDIT_ARCH_64BIT |
 /// __AUDIT_ARCH_LE` (the last two `0x80000000` and `0x40000000`), EM_X86_64 libc's.
@@ -84,25 +44,18 @@ pub const CLONE_THREAD_FLAGS: u64 = (libc::CLONE_VM
     | libc::CLONE_THREAD
     | libc::CLONE_SYSVSEM
     | libc::CLONE_CHILD_CLEARTID) as u64;
-/// The largest fd (the kernel's `int`): an fd condition's upper bound, so that no high bit of the
-/// 64-bit register turns a refused number into another (the kernel reads 32 bits).
-const INT_MAX: u64 = i32::MAX as u64;
 /// [`crate::Config::ppoll_max`]'s default.
 pub const PPOLL_FDS: u64 = 8;
 
-/// The filter's verdict on a call `d`: README.md's table, a row per row, in its order. Each row
-/// widens what a compromised program can do through the gate, so each says why. `n` is the fd
-/// floor ([`crate::Fds::n`]): lockdown leaves the kept fds, and only them, at `0..n`; an fd at
-/// or above `n` can only be one a row made after lockdown (the kernel gives the lowest free
-/// number). `fs` and `net` are the plugins' ([`crate::Config::fs_root`], [`crate::Config::net`]).
-///
-/// Every plugin row's fd, directory fd among them, is at or above `n` (one the plugin opened,
-/// never a kept one, never `AT_FDCWD`); an absolute path ignores its directory fd, so the
-/// runtime opens a root by its path with any such number. `AT_EMPTY_PATH` (a call on the
-/// directory fd itself) is in no row. Paths and addresses are pointers seccomp can't read: a
-/// path is confined by lockdown's Landlock ruleset (the roots), an address by the network
-/// namespace the caller runs the process in.
-pub fn policy(mode: Mode, n: u64, ppoll_max: u64, gate: u64, fs: Fs, net: bool) -> impl Fn(&seccomp_data) -> u32 {
+/// The core's verdict on a call `d`: README.md's core table, a row per row, in its order. Each
+/// row widens what a compromised program can do through the gate, so each says why. `n` is the
+/// fd floor ([`crate::Fds::n`]): lockdown leaves the kept fds, and only them, at `0..n`; an fd at
+/// or above `n` can only be one a plugin's row made after lockdown (the kernel gives the lowest
+/// free number). The core knows no plugin: a call its rows don't allow is [`NO_MATCH`], which
+/// the composition (`crate::plugin::policy`) gives to the enabled plugins' rows, and else kills.
+/// The arch and gate checks come first and are final: no plugin row sees another ABI's call or
+/// the program's.
+pub fn policy(mode: Mode, n: u64, ppoll_max: u64, gate: u64) -> impl Fn(&seccomp_data) -> u32 {
     move |d| {
         // Another ABI: the rows know only x86-64's numbers, and must not judge another's.
         if d.arch != AUDIT_ARCH_X86_64 || d.nr as u32 >= X32_SYSCALL_BIT {
@@ -114,19 +67,11 @@ pub fn policy(mode: Mode, n: u64, ppoll_max: u64, gate: u64, fs: Fs, net: bool) 
         }
         let threads = mode != Mode::Coroutine;
         let fork = mode == Mode::Fork;
-        let files = fs != Fs::Off;
-        let writes = fs == Fs::ReadWrite;
-        // Fds at or above `n` exist: a plugin's rows make them.
-        let opened = files || net;
         match d.nr as i64 {
-            // A kept fd (below `n`), as its own mode allows; with a plugin also one it opened
-            // (every fd at or above `n` is).
-            SYS_read | SYS_write if d.args[0] < n || (opened && d.args[0] <= INT_MAX) => SECCOMP_RET_ALLOW,
-            // Readiness only, at most `ppoll_max` fds (with the net plugin `PPOLL_NET_FDS`); no
-            // signal mask (it could unblock SIGSYS).
-            SYS_ppoll if (d.args[1] <= ppoll_max || (net && d.args[1] <= PPOLL_NET_FDS)) && d.args[3] == 0 => {
-                SECCOMP_RET_ALLOW
-            }
+            // A kept fd (below `n`), as its own mode allows.
+            SYS_read | SYS_write if d.args[0] < n => SECCOMP_RET_ALLOW,
+            // Readiness only, at most `ppoll_max` fds; no signal mask (it could unblock SIGSYS).
+            SYS_ppoll if d.args[1] <= ppoll_max && d.args[3] == 0 => SECCOMP_RET_ALLOW,
             // The end of the process; the SIGSYS handler's return, and a new host thread's start.
             SYS_exit_group | SYS_rt_sigreturn => SECCOMP_RET_ALLOW,
             // A host thread: exactly its flags, all 64 bits (no namespaces, no SETTLS, no vfork).
@@ -144,166 +89,15 @@ pub fn policy(mode: Mode, n: u64, ppoll_max: u64, gate: u64, fs: Fs, net: bool) 
             }
             // Plugin: fs, net. The close of an fd a plugin opened (at or above `n`), never a kept
             // one (the guest answers that).
-            SYS_close if opened && d.args[0] >= n && d.args[0] <= INT_MAX => SECCOMP_RET_ALLOW,            // Plugin: fs. A file by its path (absolute, or relative to a directory the plugin
-            // opened), within the roots (Landlock). Always `O_NONBLOCK` and `O_CLOEXEC`: an open
-            // never waits (a FIFO's, a device's); the runtime clears `O_NONBLOCK` after its
-            // `fstat` finds a regular file or a directory (the runtime's, not a guarantee: it
-            // avoids a hang). A path's metadata is this open, then `fstat` (no `statx`,
-            // `newfstatat`, `fstatfs`: the guest fakes statfs). Read-only: `O_RDONLY`, with any of `O_DIRECTORY`, `O_NOFOLLOW`.
-            // Read-write also: `O_WRONLY` or `O_RDWR` with `O_TRUNC` or `O_APPEND`, and
-            // `O_CREAT` (`O_EXCL` with it) for each access mode, the mode without `S_ISUID` or
-            // `S_ISGID` (the kernel ignores it without `O_CREAT`: pinned anyway). Never
-            // `O_PATH`, `O_TMPFILE`, `O_DIRECT`.
-            SYS_openat
-                if files
-                    && d.args[0] >= n
-                    && d.args[0] <= INT_MAX
-                    && d.args[3] <= MODE_MAX
-                    && (d.args[2] == O_RDONLY | O_NB
-                        || d.args[2] == O_RDONLY | O_NOFOLLOW | O_NB
-                        || d.args[2] == O_RDONLY | O_DIRECTORY | O_NB
-                        || d.args[2] == O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NB
-                        || (writes
-                            && (d.args[2] == O_RDONLY | O_CREAT | O_NB
-                                || d.args[2] == O_RDONLY | O_CREAT | O_EXCL | O_NB
-                                || d.args[2] == O_WRONLY | O_NB
-                                || d.args[2] == O_WRONLY | O_TRUNC | O_NB
-                                || d.args[2] == O_WRONLY | O_APPEND | O_NB
-                                || d.args[2] == O_WRONLY | O_CREAT | O_NB
-                                || d.args[2] == O_WRONLY | O_CREAT | O_TRUNC | O_NB
-                                || d.args[2] == O_WRONLY | O_CREAT | O_APPEND | O_NB
-                                || d.args[2] == O_WRONLY | O_CREAT | O_EXCL | O_NB
-                                || d.args[2] == O_RDWR | O_NB
-                                || d.args[2] == O_RDWR | O_TRUNC | O_NB
-                                || d.args[2] == O_RDWR | O_APPEND | O_NB
-                                || d.args[2] == O_RDWR | O_CREAT | O_NB
-                                || d.args[2] == O_RDWR | O_CREAT | O_TRUNC | O_NB
-                                || d.args[2] == O_RDWR | O_CREAT | O_APPEND | O_NB
-                                || d.args[2] == O_RDWR | O_CREAT | O_EXCL | O_NB))) =>
-            {
-                SECCOMP_RET_ALLOW
-            }            // Plugin: fs. An opened file's metadata, entries and bytes at an offset (no `lseek`:
-            // files are read and written only with `pread64`/`pwrite64`, at offsets the guest
-            // kernel keeps, so the host's shared offset is never used and no host thread's seek
-            // races another's read; `read`/`write` are for sockets and stdio).
-            SYS_fstat | SYS_getdents64 | SYS_pread64 if files && d.args[0] >= n && d.args[0] <= INT_MAX => SECCOMP_RET_ALLOW,
-            // Plugin: fs. A symlink's target.
-            SYS_readlinkat if files && d.args[0] >= n && d.args[0] <= INT_MAX => SECCOMP_RET_ALLOW,            // Plugin: fs, read-write. A directory made, or a mode changed: no `S_ISUID`, `S_ISGID`.
-            SYS_mkdirat | SYS_fchmodat if writes && d.args[0] >= n && d.args[0] <= INT_MAX && d.args[2] <= MODE_MAX => {
-                SECCOMP_RET_ALLOW
-            }            // Plugin: fs, read-write. A name removed (a file's; with `AT_REMOVEDIR` a directory's).
-            SYS_unlinkat if writes && d.args[0] >= n && d.args[0] <= INT_MAX && (d.args[2] == 0 || d.args[2] == AT_REMOVEDIR) => {
-                SECCOMP_RET_ALLOW
-            }            // Plugin: fs, read-write. A rename, flags 0, `RENAME_NOREPLACE` or `RENAME_EXCHANGE`
-            // (no `RENAME_WHITEOUT`).
-            SYS_renameat2
-                if writes
-                    && d.args[0] >= n
-                    && d.args[0] <= INT_MAX
-                    && d.args[2] >= n
-                    && d.args[2] <= INT_MAX
-                    && d.args[4] <= RENAME_EXCHANGE =>
-            {
-                SECCOMP_RET_ALLOW
-            }            // Plugin: fs, read-write. A symlink made.
-            SYS_symlinkat if writes && d.args[1] >= n && d.args[1] <= INT_MAX => SECCOMP_RET_ALLOW,            // Plugin: fs, read-write. A path's times (a path given: a null one is the directory
-            // fd's own), flags 0 or `AT_SYMLINK_NOFOLLOW`.
-            SYS_utimensat
-                if writes
-                    && d.args[0] >= n
-                    && d.args[0] <= INT_MAX
-                    && d.args[1] != 0
-                    && (d.args[3] == 0 || d.args[3] == AT_SYMLINK_NOFOLLOW) =>
-            {
-                SECCOMP_RET_ALLOW
-            }
-            // Plugin: fs, read-write. An opened file's size, sync, and bytes at an offset.
-            SYS_ftruncate | SYS_fsync | SYS_pwrite64 if writes && d.args[0] >= n && d.args[0] <= INT_MAX => SECCOMP_RET_ALLOW,
-            // Plugin: net. An IPv4 or IPv6 TCP or UDP socket, optionally nonblocking and
-            // close-on-exec, protocol 0 (no raw, packet, netlink or unix socket). Any address:
-            // the network namespace is the caller's.
-            SYS_socket
-                if net
-                    && (d.args[0] == AF_INET || d.args[0] == AF_INET6)
-                    && (d.args[1] == SOCK_STREAM
-                        || d.args[1] == SOCK_STREAM | SOCK_NONBLOCK
-                        || d.args[1] == SOCK_STREAM | SOCK_CLOEXEC
-                        || d.args[1] == SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC
-                        || d.args[1] == SOCK_DGRAM
-                        || d.args[1] == SOCK_DGRAM | SOCK_NONBLOCK
-                        || d.args[1] == SOCK_DGRAM | SOCK_CLOEXEC
-                        || d.args[1] == SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC)
-                    && d.args[2] == 0 =>
-            {
-                SECCOMP_RET_ALLOW
-            }            // Plugin: net. A socket the plugin made: its address, connection and names. Its data goes
-            // over `read` and `write` (UDP always connected: no `sendto`, `recvfrom`).
-            SYS_connect | SYS_bind | SYS_listen | SYS_getsockname | SYS_getpeername
-                if net && d.args[0] >= n && d.args[0] <= INT_MAX =>
-            {
-                SECCOMP_RET_ALLOW
-            }            // Plugin: net. A connection taken, flags of `SOCK_CLOEXEC | SOCK_NONBLOCK` only.
-            SYS_accept4
-                if net
-                    && d.args[0] >= n
-                    && d.args[0] <= INT_MAX
-                    && (d.args[3] == 0
-                        || d.args[3] == SOCK_NONBLOCK
-                        || d.args[3] == SOCK_CLOEXEC
-                        || d.args[3] == SOCK_NONBLOCK | SOCK_CLOEXEC) =>
-            {
-                SECCOMP_RET_ALLOW
-            }            // Plugin: net. A half or whole close of a connection (`SHUT_RD` to `SHUT_RDWR`).
-            SYS_shutdown if net && d.args[0] >= n && d.args[0] <= INT_MAX && d.args[1] <= libc::SHUT_RDWR as u64 => {
-                SECCOMP_RET_ALLOW
-            }            // Plugin: net. A socket option of these (level, option) pairs, each the socket's own
-            // behaviour, none reaching another socket or the host:
-            // - `SO_REUSEADDR`: a listener's port rebound while old connections are in TIME_WAIT
-            //   (Linux's doesn't take a port another socket listens on; `SO_REUSEPORT`, which
-            //   shares one, isn't here);
-            // - `SO_KEEPALIVE`: probes of an idle connection, on it alone;
-            // - `TCP_NODELAY`: Nagle's algorithm off;
-            // - `IPV6_V6ONLY`: whether an IPv6 socket takes IPv4 too.
-            SYS_setsockopt
-                if net
-                    && d.args[0] >= n
-                    && d.args[0] <= INT_MAX
-                    && ((d.args[1] == SOL_SOCKET && (d.args[2] == SO_REUSEADDR || d.args[2] == SO_KEEPALIVE))
-                        || (d.args[1] == IPPROTO_TCP && d.args[2] == TCP_NODELAY)
-                        || (d.args[1] == IPPROTO_IPV6 && d.args[2] == IPV6_V6ONLY)) =>
-            {
-                SECCOMP_RET_ALLOW
-            }
-            // Plugin: net. A nonblocking connect's result (`SO_ERROR`), and nothing else read.
-            SYS_getsockopt
-                if net && d.args[0] >= n && d.args[0] <= INT_MAX && d.args[1] == SOL_SOCKET && d.args[2] == SO_ERROR =>
-            {
-                SECCOMP_RET_ALLOW
-            }
-            // Nothing else: no memory call (the arena is reserved before), no signal (a death by
-            // one is the runtime's `exit_group(128 + n)`), nothing that makes an fd but the
-            // plugins' rows above.
-            _ => SECCOMP_RET_KILL_PROCESS,
+            // Nothing else of the core's: no memory call (the arena is reserved before), no signal
+            // (a death by one is the runtime's `exit_group(128 + n)`), nothing that makes an fd.
+            _ => NO_MATCH,
         }
     }
 }
 
-// The proof: a harness per mode and plugin choice (a mode symbolic took 5x as long as one
-// fixed: 663 s against 131 s), the floor, bound and gate symbolic (`filter::proof::*`).
-#[cfg(kani)]
-mod proof {
-    use super::*;
-    seccomp_fn_verify::prove!(policy, filter, unwind = 1024, (
-        Mode = [coroutine: Coroutine, threaded: Threaded, fork: Fork], _, _, _,
-        Fs = [no_fs: Off, fs_ro: ReadOnly, fs_rw: ReadWrite],
-        bool = [no_net: false, net: true]
-    ));
-}
-
-/// The filter for `mode`, the fd floor `n` ([`crate::Fds::n`]), `ppoll_max`, the gate
-/// ([`crate::Config::gate`]) and the plugins ([`crate::Config::fs_root`], [`crate::Config::net`]):
-/// [`policy`]'s program.
-/// Public, so the exact program can be inspected and tested.
-pub fn filter(mode: Mode, n: u64, ppoll_max: u64, gate: u64, fs: Fs, net: bool) -> Vec<sock_filter> {
-    seccomp_fn::bpf!(policy(mode, n, ppoll_max, gate, fs, net))
+/// The core's program ([`policy`]'s, `NO_MATCH` included: the composition turns it into the
+/// plugins' turn). Public, so the exact program can be inspected and tested.
+pub fn filter(mode: Mode, n: u64, ppoll_max: u64, gate: u64) -> Vec<sock_filter> {
+    seccomp_fn::bpf!(policy(mode, n, ppoll_max, gate))
 }

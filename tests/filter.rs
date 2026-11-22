@@ -76,7 +76,10 @@ fn program_rows(mode: Mode, fs: Fs, net: bool) -> Vec<Vec<u32>> {
             in_row = false;
         }
         // A row starts after a return (the previous row's verdicts) or at the program's start.
-        row_start = i.code == (libc::BPF_RET | libc::BPF_K) as u16 || (i.code == ld_nr && i.k == off_nr && out.last().is_some_and(|r| r.is_empty()));
+        // (A plugin's rows start after the part before it, whose "no match" is a JA past its end.)
+        row_start = i.code == (libc::BPF_RET | libc::BPF_K) as u16
+            || i.code == (libc::BPF_JMP | libc::BPF_JA) as u16
+            || (i.code == ld_nr && i.k == off_nr && out.last().is_some_and(|r| r.is_empty()));
     }
     out.retain(|r| !r.is_empty());
     out
@@ -164,7 +167,8 @@ fn readme_table_is_the_policy() {
                         table.extend(row.iter().copied());
                         ordered.push(row);
                     }
-                    if cells[0].contains("`ppoll`") {
+                    // The core's (a plugin's own `ppoll` row has its own bound).
+                    if cells[0].contains("`ppoll`") && tags == "all" {
                         assert!(cells[1].contains(&format!("at most {PPOLL_FDS} fds")), "{line}");
                     }
                 }
@@ -175,7 +179,7 @@ fn readme_table_is_the_policy() {
             }
         }
     }
-    assert_eq!(lines.len(), 22, "README.md's allowlist tables: their rows (6 core, 16 plugin)");
+    assert_eq!(lines.len(), 26, "README.md's allowlist tables: their rows (6 core, 11 fs, 9 net)");
 }
 
 /// The program's length in each mode and plugin choice (the kernel takes 4096).
