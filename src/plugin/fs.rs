@@ -3,48 +3,39 @@
 //! lockdown after `no_new_privs`), and the rows below allow the calls on them, each fd and
 //! directory fd at or above the floor `n` (one this plugin's `openat` made, never a kept one,
 //! never `AT_FDCWD`). Paths are pointers seccomp can't read: Landlock is what confines them.
-#![allow(non_upper_case_globals)] // libc's syscall names, as patterns
 
 use std::io;
 use std::os::fd::{OwnedFd, RawFd};
 use std::path::PathBuf;
 
-use libc::{seccomp_data, sock_filter};
-use libc::{
-    SYS_close, SYS_fchmodat, SYS_fstat, SYS_fsync, SYS_ftruncate, SYS_getdents64, SYS_mkdirat, SYS_openat, SYS_pread64,
-    SYS_pwrite64, SYS_readlinkat, SYS_renameat2, SYS_symlinkat, SYS_unlinkat, SYS_utimensat,
-};
-use libc::{SECCOMP_RET_ALLOW, SECCOMP_RET_KILL_PROCESS};
+use libc::seccomp_data;
+use seccomp_fn_verify::calls::{Call, CallExt};
+use seccomp_fn_verify::expr::Cond;
 use rustix::fs::{Mode as FsMode, OFlags};
 
-use super::{Plugin, Rows};
+use super::Plugin;
 use crate::{Error, Result};
 
-// Flags the rows compare with, libc's, as u64 (the registers' width).
-const O_RDONLY: u64 = libc::O_RDONLY as u64;
-const O_WRONLY: u64 = libc::O_WRONLY as u64;
-const O_RDWR: u64 = libc::O_RDWR as u64;
-const O_CREAT: u64 = libc::O_CREAT as u64;
-const O_EXCL: u64 = libc::O_EXCL as u64;
-const O_TRUNC: u64 = libc::O_TRUNC as u64;
-const O_APPEND: u64 = libc::O_APPEND as u64;
-const O_NONBLOCK: u64 = libc::O_NONBLOCK as u64;
-const O_DIRECTORY: u64 = libc::O_DIRECTORY as u64;
-const O_NOFOLLOW: u64 = libc::O_NOFOLLOW as u64;
-const O_CLOEXEC: u64 = libc::O_CLOEXEC as u64;
+// Flags the rows compare with, libc's, as the typed view's fields have them (`flags`: an `int`).
+const O_RDONLY: i32 = libc::O_RDONLY;
+const O_WRONLY: i32 = libc::O_WRONLY;
+const O_RDWR: i32 = libc::O_RDWR;
+const O_CREAT: i32 = libc::O_CREAT;
+const O_EXCL: i32 = libc::O_EXCL;
+const O_TRUNC: i32 = libc::O_TRUNC;
+const O_APPEND: i32 = libc::O_APPEND;
+const O_DIRECTORY: i32 = libc::O_DIRECTORY;
+const O_NOFOLLOW: i32 = libc::O_NOFOLLOW;
 /// Every `openat`'s: nonblocking (a FIFO or a device must not block the open), close-on-exec.
-const O_NB: u64 = O_NONBLOCK | O_CLOEXEC;
-const AT_SYMLINK_NOFOLLOW: u64 = libc::AT_SYMLINK_NOFOLLOW as u64;
-const AT_REMOVEDIR: u64 = libc::AT_REMOVEDIR as u64;
-/// A created file's or directory's mode, or a new one: below `S_ISGID` (0o2000), so neither it
-/// nor `S_ISUID` (the sticky bit may be).
-const MODE_MAX: u64 = 0o1777;
+const O_NB: i32 = libc::O_NONBLOCK | libc::O_CLOEXEC;
+const AT_SYMLINK_NOFOLLOW: i32 = libc::AT_SYMLINK_NOFOLLOW;
+const AT_REMOVEDIR: i32 = libc::AT_REMOVEDIR;
+/// A created file's or directory's mode, or a new one (`umode_t`): below `S_ISGID` (0o2000), so
+/// neither it nor `S_ISUID` (the sticky bit may be).
+const MODE_MAX: u16 = 0o1777;
 /// include/uapi/linux/fs.h's `RENAME_EXCHANGE` (libc has it for glibc only): with 0 and
 /// `RENAME_NOREPLACE` (1) the flags `renameat2` may have; `RENAME_WHITEOUT` is 4.
-const RENAME_EXCHANGE: u64 = 2;
-/// The largest fd (the kernel's `int`): an fd condition's upper bound, so that no high bit of the
-/// 64-bit register turns a refused number into another (the kernel reads 32 bits).
-const INT_MAX: u64 = i32::MAX as u64;
+const RENAME_EXCHANGE: u32 = 2;
 
 /// A file plugin's access ([`Files::root`]): which rows the filter has, and which rights
 /// Landlock gives a root.
@@ -123,109 +114,88 @@ impl Plugin for Files {
         Ok(())
     }
 
-    fn rows(&self) -> Rows {
+    fn rows(&self, n: u32) -> Option<Cond> {
         match self.access() {
-            Fs::Off => Rows::None,
-            a => Rows::Files(a),
+            Fs::Off => None,
+            a => Some(rows(n, a == Fs::ReadWrite)),
         }
     }
 }
 
-/// The rows: ALLOW, or KILL_PROCESS for no match (the composition, `super::policy`, reads any
-/// verdict but ALLOW as none). `n` is the floor; `writes` the read-write rows.
-pub(crate) fn policy(n: u64, writes: bool) -> impl Fn(&seccomp_data) -> u32 {
-    move |d| {
-        match d.nr as i64 {
-            // The close of an fd this plugin opened, never a kept one (the guest answers that).
-            SYS_close if d.args[0] >= n && d.args[0] <= INT_MAX => SECCOMP_RET_ALLOW,
-            // A file by its path (absolute, or relative to a directory the plugin
-            // opened), within the roots (Landlock). Always `O_NONBLOCK` and `O_CLOEXEC`: an open
-            // never waits (a FIFO's, a device's); the runtime clears `O_NONBLOCK` after its
-            // `fstat` finds a regular file or a directory (the runtime's, not a guarantee: it
-            // avoids a hang). A path's metadata is this open, then `fstat` (no `statx`,
-            // `newfstatat`, `fstatfs`: the guest fakes statfs). Read-only: `O_RDONLY`, with any of `O_DIRECTORY`, `O_NOFOLLOW`.
-            // Read-write also: `O_WRONLY` or `O_RDWR` with `O_TRUNC` or `O_APPEND`, and
-            // `O_CREAT` (`O_EXCL` with it) for each access mode, the mode without `S_ISUID` or
-            // `S_ISGID` (the kernel ignores it without `O_CREAT`: pinned anyway). Never
-            // `O_PATH`, `O_TMPFILE`, `O_DIRECT`.
-            SYS_openat
-                if d.args[0] >= n
-                    && d.args[0] <= INT_MAX
-                    && d.args[3] <= MODE_MAX
-                    && (d.args[2] == O_RDONLY | O_NB
-                        || d.args[2] == O_RDONLY | O_NOFOLLOW | O_NB
-                        || d.args[2] == O_RDONLY | O_DIRECTORY | O_NB
-                        || d.args[2] == O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NB
-                        || (writes
-                            && (d.args[2] == O_RDONLY | O_CREAT | O_NB
-                                || d.args[2] == O_RDONLY | O_CREAT | O_EXCL | O_NB
-                                || d.args[2] == O_WRONLY | O_NB
-                                || d.args[2] == O_WRONLY | O_TRUNC | O_NB
-                                || d.args[2] == O_WRONLY | O_APPEND | O_NB
-                                || d.args[2] == O_WRONLY | O_CREAT | O_NB
-                                || d.args[2] == O_WRONLY | O_CREAT | O_TRUNC | O_NB
-                                || d.args[2] == O_WRONLY | O_CREAT | O_APPEND | O_NB
-                                || d.args[2] == O_WRONLY | O_CREAT | O_EXCL | O_NB
-                                || d.args[2] == O_RDWR | O_NB
-                                || d.args[2] == O_RDWR | O_TRUNC | O_NB
-                                || d.args[2] == O_RDWR | O_APPEND | O_NB
-                                || d.args[2] == O_RDWR | O_CREAT | O_NB
-                                || d.args[2] == O_RDWR | O_CREAT | O_TRUNC | O_NB
-                                || d.args[2] == O_RDWR | O_CREAT | O_APPEND | O_NB
-                                || d.args[2] == O_RDWR | O_CREAT | O_EXCL | O_NB))) =>
-            {
-                SECCOMP_RET_ALLOW
-            }
-            // An opened file's metadata, entries and bytes at an offset (no `lseek`:
-            // files are read and written only with `pread64`/`pwrite64`, at offsets the guest
-            // kernel keeps, so the host's shared offset is never used and no host thread's seek
-            // races another's read; `read`/`write` are for sockets and stdio).
-            SYS_fstat | SYS_getdents64 | SYS_pread64 if d.args[0] >= n && d.args[0] <= INT_MAX => SECCOMP_RET_ALLOW,
-            // A symlink's target.
-            SYS_readlinkat if d.args[0] >= n && d.args[0] <= INT_MAX => SECCOMP_RET_ALLOW,
-            // Read-write: A directory made, or a mode changed: no `S_ISUID`, `S_ISGID`.
-            SYS_mkdirat | SYS_fchmodat if writes && d.args[0] >= n && d.args[0] <= INT_MAX && d.args[2] <= MODE_MAX => {
-                SECCOMP_RET_ALLOW
-            }
-            // Read-write: A name removed (a file's; with `AT_REMOVEDIR` a directory's).
-            SYS_unlinkat if writes && d.args[0] >= n && d.args[0] <= INT_MAX && (d.args[2] == 0 || d.args[2] == AT_REMOVEDIR) => {
-                SECCOMP_RET_ALLOW
-            }
-            // Read-write: A rename, flags 0, `RENAME_NOREPLACE` or `RENAME_EXCHANGE`
-            // (no `RENAME_WHITEOUT`).
-            SYS_renameat2
-                if writes
-                    && d.args[0] >= n
-                    && d.args[0] <= INT_MAX
-                    && d.args[2] >= n
-                    && d.args[2] <= INT_MAX
-                    && d.args[4] <= RENAME_EXCHANGE =>
-            {
-                SECCOMP_RET_ALLOW
-            }
-            // Read-write: A symlink made.
-            SYS_symlinkat if writes && d.args[1] >= n && d.args[1] <= INT_MAX => SECCOMP_RET_ALLOW,
-            // Read-write: A path's times (a path given: a null one is the directory
-            // fd's own), flags 0 or `AT_SYMLINK_NOFOLLOW`.
-            SYS_utimensat
-                if writes
-                    && d.args[0] >= n
-                    && d.args[0] <= INT_MAX
-                    && d.args[1] != 0
-                    && (d.args[3] == 0 || d.args[3] == AT_SYMLINK_NOFOLLOW) =>
-            {
-                SECCOMP_RET_ALLOW
-            }
-            // Read-write: An opened file's size, sync, and bytes at an offset.
-            SYS_ftruncate | SYS_fsync | SYS_pwrite64 if writes && d.args[0] >= n && d.args[0] <= INT_MAX => SECCOMP_RET_ALLOW,
-            _ => SECCOMP_RET_KILL_PROCESS,
+/// The rows: whether they allow `d`. `n` is the floor (each fd and directory fd at or above it,
+/// as the kernel reads it: an `unsigned int` fd, an `int` directory fd, so never `AT_FDCWD`);
+/// `writes` the read-write rows.
+pub(crate) fn files(d: &seccomp_data, n: u32, writes: bool) -> bool {
+    let opened = |fd: u32| fd >= n;
+    let opened_dir = |dfd: i32| dfd >= n as i32;
+    match d.call() {
+        // The close of an fd this plugin opened, never a kept one (the guest answers that).
+        Call::Close { fd } => opened(fd),
+        // A file by its path (absolute, or relative to a directory the plugin opened), within
+        // the roots (Landlock). Always `O_NONBLOCK` and `O_CLOEXEC`: an open never waits (a
+        // FIFO's, a device's); the runtime clears `O_NONBLOCK` after its `fstat` finds a regular
+        // file or a directory (the runtime's, not a guarantee: it avoids a hang). A path's
+        // metadata is this open, then `fstat` (no `statx`, `newfstatat`, `fstatfs`: the guest
+        // fakes statfs). Read-only: `O_RDONLY`, with any of `O_DIRECTORY`, `O_NOFOLLOW`.
+        // Read-write also: `O_WRONLY` or `O_RDWR` with `O_TRUNC` or `O_APPEND`, and `O_CREAT`
+        // (`O_EXCL` with it) for each access mode, the mode without `S_ISUID` or `S_ISGID` (the
+        // kernel ignores it without `O_CREAT`: pinned anyway). Never `O_PATH`, `O_TMPFILE`,
+        // `O_DIRECT`.
+        Call::Openat { dfd, flags, mode, .. } => {
+            opened_dir(dfd)
+                && mode <= MODE_MAX
+                && (flags == O_RDONLY | O_NB
+                    || flags == O_RDONLY | O_NOFOLLOW | O_NB
+                    || flags == O_RDONLY | O_DIRECTORY | O_NB
+                    || flags == O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NB
+                    || writes
+                        && (flags == O_RDONLY | O_CREAT | O_NB
+                            || flags == O_RDONLY | O_CREAT | O_EXCL | O_NB
+                            || flags == O_WRONLY | O_NB
+                            || flags == O_WRONLY | O_TRUNC | O_NB
+                            || flags == O_WRONLY | O_APPEND | O_NB
+                            || flags == O_WRONLY | O_CREAT | O_NB
+                            || flags == O_WRONLY | O_CREAT | O_TRUNC | O_NB
+                            || flags == O_WRONLY | O_CREAT | O_APPEND | O_NB
+                            || flags == O_WRONLY | O_CREAT | O_EXCL | O_NB
+                            || flags == O_RDWR | O_NB
+                            || flags == O_RDWR | O_TRUNC | O_NB
+                            || flags == O_RDWR | O_APPEND | O_NB
+                            || flags == O_RDWR | O_CREAT | O_NB
+                            || flags == O_RDWR | O_CREAT | O_TRUNC | O_NB
+                            || flags == O_RDWR | O_CREAT | O_APPEND | O_NB
+                            || flags == O_RDWR | O_CREAT | O_EXCL | O_NB))
         }
+        // An opened file's metadata, entries and bytes at an offset (no `lseek`: files are read
+        // and written only with `pread64`/`pwrite64`, at offsets the guest kernel keeps, so the
+        // host's shared offset is never used and no host thread's seek races another's read;
+        // `read`/`write` are for sockets and stdio).
+        Call::Fstat { fd, .. } | Call::Getdents64 { fd, .. } | Call::Pread64 { fd, .. } => opened(fd),
+        // A symlink's target.
+        Call::Readlinkat { dfd, .. } => opened_dir(dfd),
+        // Read-write: a directory made, or a mode changed: no `S_ISUID`, `S_ISGID`.
+        Call::Mkdirat { dfd, mode, .. } | Call::Fchmodat { dfd, mode, .. } => writes && opened_dir(dfd) && mode <= MODE_MAX,
+        // Read-write: a name removed (a file's; with `AT_REMOVEDIR` a directory's).
+        Call::Unlinkat { dfd, flag, .. } => writes && opened_dir(dfd) && (flag == 0 || flag == AT_REMOVEDIR),
+        // Read-write: a rename, flags 0, `RENAME_NOREPLACE` or `RENAME_EXCHANGE` (no
+        // `RENAME_WHITEOUT`).
+        Call::Renameat2 { olddfd, newdfd, flags, .. } => writes && opened_dir(olddfd) && opened_dir(newdfd) && flags <= RENAME_EXCHANGE,
+        // Read-write: a symlink made.
+        Call::Symlinkat { newdfd, .. } => writes && opened_dir(newdfd),
+        // Read-write: a path's times (a path given: a null one is the directory fd's own),
+        // flags 0 or `AT_SYMLINK_NOFOLLOW`.
+        Call::Utimensat { dfd, filename, flags, .. } => {
+            writes && opened_dir(dfd) && !filename.is_null() && (flags == 0 || flags == AT_SYMLINK_NOFOLLOW)
+        }
+        // Read-write: an opened file's size, sync, and bytes at an offset.
+        Call::Ftruncate { fd, .. } | Call::Fsync { fd, .. } | Call::Pwrite64 { fd, .. } => writes && opened(fd),
+        _ => false,
     }
 }
 
-/// [`policy`]'s program.
-pub(crate) fn filter(n: u64, writes: bool) -> Vec<sock_filter> {
-    seccomp_fn::bpf!(policy(n, writes))
+/// [`files`]'s rows, as the combinator's sub-filter (`crate::filter`).
+pub(crate) fn rows(n: u32, writes: bool) -> Cond {
+    seccomp_fn::rows!(files(d, n, writes))
 }
 
 // Landlock's (include/uapi/linux/landlock.h; not in libc): the calls, and the fs rights.

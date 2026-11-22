@@ -12,14 +12,13 @@
 //! filter.rs) imports neither. Every fd a plugin's calls make is at or above the floor `n`
 //! (lockdown leaves only the kept fds below it), and each of its fd rows says `fd >= n`.
 //!
-//! **Composition, for now.** Today's compiler compiles one function of one file, so the rows
-//! are a fixed set per plugin, named by [`Rows`], and `crate::filter`'s `policy`/`filter`
-//! compose the core's and each enabled plugin's, as one function and one program, for the proof
-//! (Kani: `filter::proof::*`, over every mode and plugin choice). The structural compiler's combinator
-//! replaces this: a plugin then hands its own compiled rows (allow or fall through, proven
-//! once), and [`Rows`] goes.
+//! **Composition.** A plugin's rows are a condition of the tree (seccomp-fn's `rows!` of a
+//! function of its file), which seccomp-fn-verify's combinator (`expr::gated`) puts after the
+//! core's, behind the arch and gate checks: a sub-filter can only allow, never change the checks
+//! before it. The compiler is proven once for every tree, the combinator's among them.
 
 use crate::Result;
+use seccomp_fn_verify::expr::Cond;
 
 pub(crate) mod fs;
 pub(crate) mod net;
@@ -30,17 +29,6 @@ pub use net::Net;
 /// An fd a plugin keeps past lockdown, as a grant is kept (one of `0..n`, the caller's to place).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeptFd(pub std::os::fd::RawFd);
-
-/// Which rows a plugin adds (see the module's "Composition, for now").
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Rows {
-    /// None: a plugin of setup only.
-    None,
-    /// The file rows, read-only or read-write ([`Files`]).
-    Files(Fs),
-    /// The socket rows ([`Net`]).
-    Net,
-}
 
 /// A plugin: setup, kept fds, rows. Lockdown calls [`Plugin::check`] before it changes anything,
 /// [`Plugin::setup`] at its step 7b, and reads the others once.
@@ -59,15 +47,6 @@ pub trait Plugin {
     fn kept(&self) -> &[KeptFd] {
         &[]
     }
-    /// Its rows: allowed after the core's rows found none, or nothing.
-    fn rows(&self) -> Rows;
-}
-
-/// What a set of plugins adds to the filter: the widest file access, and whether any is the net's.
-pub(crate) fn rows(plugins: &[&dyn Plugin]) -> (Fs, bool) {
-    plugins.iter().fold((Fs::Off, false), |(fs, net), p| match p.rows() {
-        Rows::None => (fs, net),
-        Rows::Files(a) => (fs.max(a), net),
-        Rows::Net => (fs, true),
-    })
+    /// Its rows, for the floor `n`: allowed after the core's rows found none, or none.
+    fn rows(&self, n: u32) -> Option<Cond>;
 }

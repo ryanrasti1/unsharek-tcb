@@ -14,7 +14,7 @@ use rustix::io::Errno;
 use rustix::process::{DumpableBehavior, Resource, Rlimit};
 use rustix::thread::{CapabilitySet, CapabilitySets};
 
-use crate::plugin::{self, Plugin};
+use crate::plugin::Plugin;
 use crate::{Config, Error, Kind, Mode, Result, filter};
 
 pub(crate) fn os(what: &'static str) -> impl FnOnce(io::Error) -> Error {
@@ -66,8 +66,8 @@ pub(crate) fn lockdown(config: Config, plugins: &[&dyn Plugin]) -> Result<()> {
             return Err(Error::ModeKind { fd, kind, mode });
         }
     }
-    let (fs, net) = plugin::rows(plugins);
-    let prog = filter::filter(mode, n as u64, config.gate, fs, net);
+    let subs = plugins.iter().filter_map(|p| p.rows(n as u32)).collect();
+    let prog = filter::program(mode, config.gate, subs);
     // What the plugins need of the kernel (the file plugin's Landlock): refused now, before
     // anything changes, if not there.
     for p in plugins {

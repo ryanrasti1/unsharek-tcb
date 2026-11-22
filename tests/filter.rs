@@ -1,12 +1,17 @@
-//! The filter is its policy: [`policy`] is the filter, as a Rust function, and Kani proves
-//! [`filter`]'s program gives its verdict on every call (`cargo kani`, `cargo xtask prove`). Here,
-//! in seconds: the same assertion sampled (seccomp-fn-verify's `check_sampled`), for each mode
-//! and some params; README.md's table against the policy's rows.
+//! The filter is its policy: [`policy`] is the filter, as a Rust function, and [`filter`]'s
+//! program is seccomp-fn-verify's compile of its tree, proven once for every tree. Here, in
+//! seconds: the same assertion sampled (seccomp-fn-verify's `check_sampled`), for each mode and
+//! some params; the verdicts the same as before the typed view (`same_as_before`); README.md's
+//! table against the policy's rows.
+
+#[path = "old/mod.rs"]
+mod old;
 
 use unsharek_tcb::plugin::{Fs, Net};
-use unsharek_tcb::{AUDIT_ARCH_X86_64, Mode, PPOLL_FDS, RET_ALLOW, filter, policy, seccomp_data, sock_filter};
+use unsharek_tcb::{AUDIT_ARCH_X86_64, Mode, RET_ALLOW, filter, policy, seccomp_data, sock_filter};
 
-const PPOLL_NET_FDS: u64 = Net::PPOLL_FDS;
+const PPOLL_FDS: u64 = unsharek_tcb::PPOLL_FDS as u64;
+const PPOLL_NET_FDS: u64 = Net::PPOLL_FDS as u64;
 
 const GATE: u64 = 0x0000_7f12_3456_7890;
 /// The fd floor the tests use: kept fds 0..N.
@@ -26,6 +31,90 @@ fn filter_is_the_policy() {
             }
         }
     }
+}
+
+/// The verdicts are the policy's before the typed view (`old`, the same rows over raw
+/// arguments) on every call whose arguments the kernel reads as they are: each a 32-bit one's
+/// below 2^31, no high half (each call's every number, its args drawn from the constants the
+/// rows compare with, each either side, and extremes). Past that the two differ on purpose: a
+/// 32-bit argument's high half is ignored, as the kernel ignores it (`typed_high_halves`).
+#[test]
+fn same_as_before() {
+    let mut s = 0x9e37_79b9_7f4a_7c15u64;
+    let mut rand = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let ks: Vec<u64> = vec![0, 1, 2, 3, 4, 7, 8, 9, 10, 0o1777, 0o2000, 128, 4096, 4097, 0x7fff_ffff];
+    let mut flags: Vec<u64> = vec![];
+    for a in [libc::O_RDONLY, libc::O_WRONLY, libc::O_RDWR] {
+        for b in [0, libc::O_CREAT, libc::O_CREAT | libc::O_EXCL, libc::O_TRUNC, libc::O_APPEND, libc::O_DIRECTORY, libc::O_NOFOLLOW, libc::O_PATH] {
+            flags.push((a | b | libc::O_NONBLOCK | libc::O_CLOEXEC) as u64);
+            flags.push((a | b) as u64);
+        }
+    }
+    for f in [libc::AF_INET, libc::AF_INET6, libc::AF_UNIX, libc::SOCK_STREAM, libc::SOCK_DGRAM, libc::SOCK_RAW, libc::SOCK_NONBLOCK, libc::SOCK_CLOEXEC] {
+        flags.push(f as u64);
+        flags.push((f | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) as u64);
+    }
+    for f in [libc::SOL_SOCKET, libc::SO_REUSEADDR, libc::SO_KEEPALIVE, libc::SO_ERROR, libc::IPPROTO_TCP, libc::TCP_NODELAY, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, libc::SO_REUSEPORT] {
+        flags.push(f as u64);
+    }
+    let pool: Vec<u64> = ks.iter().chain(&flags).copied().collect();
+    let clones = [unsharek_tcb::CLONE_THREAD_FLAGS, libc::SIGCHLD as u64, (libc::CLONE_PARENT | libc::SIGCHLD) as u64, 0];
+    for mode in MODES {
+        for fs in FSES {
+            for net in [false, true] {
+                let (new, before) = (policy(mode, N, GATE, fs, net), old::policy(mode, N, GATE, fs, net));
+                for nr in 0..340i64 {
+                    for _ in 0..40 {
+                        let mut args = [0u64; 6];
+                        for a in args.iter_mut() {
+                            *a = pool[rand() as usize % pool.len()];
+                        }
+                        if nr == libc::SYS_clone {
+                            args[0] = clones[rand() as usize % 4];
+                        }
+                        let d = call(nr, args);
+                        if !as_read(&d) {
+                            continue;
+                        }
+                        assert_eq!(new(&d), before(&d), "{mode:?} {fs:?} net {net}: nr {nr} args {args:x?}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Every arg of `d` is as the kernel reads it (by the call table): a 32-bit one below 2^31, a
+/// u16 below 2^16.
+fn as_read(d: &seccomp_data) -> bool {
+    use seccomp_fn_verify::calls::{CALLS, Ty};
+    let Some(r) = CALLS.iter().find(|r| r.1 == d.nr as i64) else { return true };
+    r.2.iter().enumerate().all(|(i, a)| match a.1 {
+        Ty::U16 => d.args[i] < 1 << 16,
+        Ty::U32 | Ty::I32 => d.args[i] < 1 << 31,
+        _ => true,
+    })
+}
+
+/// A 32-bit argument's high half: ignored, as the kernel reads only the low half (before the
+/// typed view, a refusal); a 64-bit one's isn't.
+#[test]
+fn typed_high_halves() {
+    let g = 0xdead_beef_0000_0000;
+    // close(fd) of a plugin's fd: its high half garbage
+    assert!(allowed(Fs::ReadOnly, false, &call(libc::SYS_close, [N | g, 0, 0, 0, 0, 0])));
+    // a kept fd's number, with high bits: still a kept fd's, refused
+    assert!(!allowed(Fs::ReadOnly, false, &call(libc::SYS_close, [1 | g, 0, 0, 0, 0, 0])));
+    // an int: AT_FDCWD (-100) read as the kernel reads it, refused whatever its high half
+    assert!(!allowed(Fs::ReadOnly, false, &call(libc::SYS_readlinkat, [(-100i32) as u32 as u64, 0, 0, 0, 0, 0])));
+    assert!(!allowed(Fs::ReadOnly, false, &call(libc::SYS_readlinkat, [(-100i64) as u64, 0, 0, 0, 0, 0])));
+    // clone's flags are 64 bits: a high bit refuses
+    assert!(!allowed(Fs::Off, false, &call(libc::SYS_clone, [unsharek_tcb::CLONE_THREAD_FLAGS | 1 << 40, 0, 0, 0, 0, 0])));
 }
 
 /// A call from the gate.
@@ -61,35 +150,30 @@ fn ruled(mode: Mode) -> std::collections::BTreeSet<u32> {
     out
 }
 
-/// The policy's rows, in order, as its program tests them: each row is a load of `nr` and a
-/// JEQ per number (the gate check's load of `nr` tests none; a JEQ of `nr` inside a row, as
-/// getsockopt's, follows other loads). Rows a build-time guard rules out aren't in the program.
+/// The policy's rows, in order, as its program tests them: each arm of a `match d.call()` is a
+/// load of `nr` and a JEQ per number (the arch check's load of `nr` is followed by a JGE, not a
+/// JEQ). Rows a build-time guard rules out aren't in the program (their arms are dead).
 fn program_rows(mode: Mode, fs: Fs, net: bool) -> Vec<Vec<u32>> {
     let ld_nr = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
     let jeq = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
+    let ja = (libc::BPF_JMP | libc::BPF_JA) as u16;
     let off_nr = std::mem::offset_of!(libc::seccomp_data, nr) as u32;
     let prog: Vec<sock_filter> = filter(mode, N, GATE, fs, net);
     let mut out: Vec<Vec<u32>> = vec![];
     let mut in_row = false;
-    let mut row_start = true;
-    for i in &prog {
-        if i.code == ld_nr {
-            in_row = i.k == off_nr && row_start;
+    for (at, i) in prog.iter().enumerate() {
+        if i.code == ld_nr && i.k == off_nr {
+            in_row = prog.get(at + 1).is_some_and(|n| n.code == jeq);
             if in_row {
                 out.push(vec![]);
             }
         } else if in_row && i.code == jeq {
             out.last_mut().unwrap().push(i.k);
-        } else {
+        } else if !(in_row && i.code == ja) {
+            // (a JA between a row's JEQs: a trampoline to a far arm)
             in_row = false;
         }
-        // A row starts after a return (the previous row's verdicts) or at the program's start.
-        // (A plugin's rows start after the part before it, whose "no match" is a JA past its end.)
-        row_start = i.code == (libc::BPF_RET | libc::BPF_K) as u16
-            || i.code == (libc::BPF_JMP | libc::BPF_JA) as u16
-            || (i.code == ld_nr && i.k == off_nr && out.last().is_some_and(|r| r.is_empty()));
     }
-    out.retain(|r| !r.is_empty());
     out
 }
 
@@ -239,8 +323,18 @@ fn ppoll_bound() {
 // The plugin rows: each allowed with its args, refused with each pinned arg changed, and
 // without its plugin.
 
-/// fd args: an opened fd (N) and a refused one each: a kept fd, AT_FDCWD (both widths), high bits.
-const BAD_FDS: [u64; 5] = [0, N - 1, (-100i64) as u64, 0xffff_ff9c, (1 << 32) | N];
+/// fd args: an opened fd (N) and a refused one each, as the kernel reads the arg (its C type,
+/// seccomp-fn-verify's call table): a kept fd, with or without a high half (ignored); an `int`
+/// directory fd's AT_FDCWD, both widths (an `unsigned int` fd's 0xffffff9c is a number no fd
+/// has: EBADF, not a refusal).
+const BAD_FDS: [u64; 4] = [0, N - 1, (1 << 32) | (N - 1), 0xffff_ffff_0000_0000];
+const BAD_DFDS: [u64; 2] = [(-100i64) as u64, 0xffff_ff9c];
+
+/// Arg `i` of call `nr` is an `int` (by the call table).
+fn int_arg(nr: i32, i: usize) -> bool {
+    use seccomp_fn_verify::calls::{CALLS, Ty};
+    CALLS.iter().find(|r| r.1 == nr as i64).is_some_and(|r| r.2.get(i).is_some_and(|a| a.1 == Ty::I32))
+}
 
 /// `ok` allowed with `on` and not with each of `offs`; and each fd arg position in `fds` refused
 /// with every bad fd.
@@ -250,7 +344,8 @@ fn row(on: (Fs, bool), offs: &[(Fs, bool)], ok: seccomp_data, fds: &[usize]) {
         assert!(!allowed(off.0, off.1, &ok), "{} without its plugin {off:?}", ok.nr);
     }
     for &i in fds {
-        for bad in BAD_FDS {
+        let dfds: &[u64] = if int_arg(ok.nr, i) { &BAD_DFDS } else { &[] };
+        for &bad in BAD_FDS.iter().chain(dfds) {
             let mut d = ok;
             d.args[i] = bad;
             assert!(!allowed(on.0, on.1, &d), "{} arg {i} = {bad:#x}", ok.nr);
@@ -311,7 +406,6 @@ fn openat_row() {
             (libc::O_TMPFILE | libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC) as u64,
             (libc::O_DIRECT | libc::O_NONBLOCK | libc::O_CLOEXEC) as u64,
             (libc::O_NOATIME | libc::O_NONBLOCK | libc::O_CLOEXEC) as u64,
-            (1u64 << 32) | (libc::O_NONBLOCK | libc::O_CLOEXEC) as u64,
         ] {
             refused(on, o(0, 0), 2, &[flags]);
         }
@@ -340,12 +434,12 @@ fn fs_rw_rows() {
     let rw = |d: seccomp_data, fds: &[usize]| row(RW, &[NONE, RO, NET], d, fds);
     for nr in [libc::SYS_mkdirat, libc::SYS_fchmodat] {
         rw(call(nr, [N, 0x1000, 0o1777, 0, 0, 0]), &[0]);
-        refused(RW, call(nr, [N, 0x1000, 0o755, 0, 0, 0]), 2, &[0o4755, 0o2755, 1 << 32]);
+        refused(RW, call(nr, [N, 0x1000, 0o755, 0, 0, 0]), 2, &[0o4755, 0o2755, 0o2000 | 1 << 32]);
     }
     rw(call(libc::SYS_unlinkat, [N, 0x1000, libc::AT_REMOVEDIR as u64, 0, 0, 0]), &[0]);
     refused(RW, call(libc::SYS_unlinkat, [N, 0x1000, 0, 0, 0, 0]), 2, &[1, libc::AT_EMPTY_PATH as u64]);
     rw(call(libc::SYS_renameat2, [N, 0x1000, N + 1, 0x2000, 2, 0]), &[0, 2]);
-    refused(RW, call(libc::SYS_renameat2, [N, 0x1000, N, 0x2000, 0, 0]), 4, &[3, 4, 1 << 32]);
+    refused(RW, call(libc::SYS_renameat2, [N, 0x1000, N, 0x2000, 0, 0]), 4, &[3, 4, 4 | 1 << 32]);
     rw(call(libc::SYS_symlinkat, [0x1000, N, 0x2000, 0, 0, 0]), &[1]);
     rw(call(libc::SYS_utimensat, [N, 0x1000, 0, libc::AT_SYMLINK_NOFOLLOW as u64, 0, 0]), &[0]);
     refused(RW, call(libc::SYS_utimensat, [N, 0x1000, 0, 0, 0, 0]), 1, &[0]);
@@ -375,9 +469,9 @@ fn net_rows() {
     }
     let fl = (libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) as u64;
     net(call(libc::SYS_accept4, [N, 0, 0, fl, 0, 0]), &[0]);
-    refused(NET, call(libc::SYS_accept4, [N, 0, 0, 0, 0, 0]), 3, &[1, 1 << 32]);
+    refused(NET, call(libc::SYS_accept4, [N, 0, 0, 0, 0, 0]), 3, &[1, 1 | 1 << 32]);
     net(call(libc::SYS_shutdown, [N, libc::SHUT_RDWR as u64, 0, 0, 0, 0]), &[0]);
-    refused(NET, call(libc::SYS_shutdown, [N, 0, 0, 0, 0, 0]), 1, &[3]);
+    refused(NET, call(libc::SYS_shutdown, [N, 0, 0, 0, 0, 0]), 1, &[3, (-1i64) as u64, 0xffff_ffff]);
     // Data over read and write only: UDP is always connected.
     for nr in [libc::SYS_sendto, libc::SYS_recvfrom, libc::SYS_sendmsg, libc::SYS_recvmsg] {
         assert!(!allowed(NET.0, NET.1, &call(nr, [N, 0x1000, 10, 0, 0, 0])), "{nr}");
