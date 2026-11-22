@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use libc::{seccomp_data, sock_filter};
 use libc::{
     SYS_close, SYS_fchmodat, SYS_fstat, SYS_fsync, SYS_ftruncate, SYS_getdents64, SYS_mkdirat, SYS_openat, SYS_pread64,
-    SYS_pwrite64, SYS_read, SYS_readlinkat, SYS_renameat2, SYS_symlinkat, SYS_unlinkat, SYS_utimensat, SYS_write,
+    SYS_pwrite64, SYS_readlinkat, SYS_renameat2, SYS_symlinkat, SYS_unlinkat, SYS_utimensat,
 };
 use libc::{SECCOMP_RET_ALLOW, SECCOMP_RET_KILL_PROCESS};
 use rustix::fs::{Mode as FsMode, OFlags};
@@ -123,8 +123,6 @@ impl Plugin for Files {
 pub(super) fn policy(n: u64, writes: bool) -> impl Fn(&seccomp_data) -> u32 {
     move |d| {
         match d.nr as i64 {
-            // An fd this plugin opened (at or above `n`; a kept one is the core's row).
-            SYS_read | SYS_write if d.args[0] >= n && d.args[0] <= INT_MAX => SECCOMP_RET_ALLOW,
             // The close of an fd this plugin opened, never a kept one (the guest answers that).
             SYS_close if d.args[0] >= n && d.args[0] <= INT_MAX => SECCOMP_RET_ALLOW,
             // A file by its path (absolute, or relative to a directory the plugin
@@ -171,7 +169,8 @@ pub(super) fn policy(n: u64, writes: bool) -> impl Fn(&seccomp_data) -> u32 {
             // races another's read; `read`/`write` are for sockets and stdio).
             SYS_fstat | SYS_getdents64 | SYS_pread64 if d.args[0] >= n && d.args[0] <= INT_MAX => SECCOMP_RET_ALLOW,
             // A symlink's target.
-            SYS_readlinkat if d.args[0] >= n && d.args[0] <= INT_MAX => SECCOMP_RET_ALLOW,            // Read-write: A directory made, or a mode changed: no `S_ISUID`, `S_ISGID`.
+            SYS_readlinkat if d.args[0] >= n && d.args[0] <= INT_MAX => SECCOMP_RET_ALLOW,
+            // Read-write: A directory made, or a mode changed: no `S_ISUID`, `S_ISGID`.
             SYS_mkdirat | SYS_fchmodat if writes && d.args[0] >= n && d.args[0] <= INT_MAX && d.args[2] <= MODE_MAX => {
                 SECCOMP_RET_ALLOW
             }
@@ -192,7 +191,8 @@ pub(super) fn policy(n: u64, writes: bool) -> impl Fn(&seccomp_data) -> u32 {
                 SECCOMP_RET_ALLOW
             }
             // Read-write: A symlink made.
-            SYS_symlinkat if writes && d.args[1] >= n && d.args[1] <= INT_MAX => SECCOMP_RET_ALLOW,            // Read-write: A path's times (a path given: a null one is the directory
+            SYS_symlinkat if writes && d.args[1] >= n && d.args[1] <= INT_MAX => SECCOMP_RET_ALLOW,
+            // Read-write: A path's times (a path given: a null one is the directory
             // fd's own), flags 0 or `AT_SYMLINK_NOFOLLOW`.
             SYS_utimensat
                 if writes

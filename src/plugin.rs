@@ -3,7 +3,7 @@
 //!
 //! 1. its **setup**, which lockdown runs at its own point (after `no_new_privs`, before the
 //!    filter): fs's Landlock ruleset;
-//! 2. the **fds it keeps** past lockdown ([`Plugin::kept`]), renumbered with the grants;
+//! 2. the **fds it keeps** past lockdown ([`Plugin::kept`]), kept as grants are;
 //! 3. its **rows** ([`Plugin::rows`]): calls the filter allows after the core's rows found none,
 //!    and after the core's arch and gate checks, so a plugin widens only what the gate itself
 //!    may call: it never decides a program's call (TRAP) or another ABI's (KILL).
@@ -32,7 +32,7 @@ pub use net::Net;
 
 use libc::{SECCOMP_RET_ALLOW, SECCOMP_RET_KILL_PROCESS};
 
-/// An fd a plugin keeps past lockdown, as a grant is kept (and renumbered: [`crate::Fds`]).
+/// An fd a plugin keeps past lockdown, as a grant is kept (one of `0..n`, the caller's to place).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeptFd(pub std::os::fd::RawFd);
 
@@ -81,7 +81,7 @@ pub(crate) fn rows(plugins: &[&dyn Plugin]) -> (Fs, bool) {
 /// its rows found none, ALLOW where an enabled plugin's rows allow, else KILL_PROCESS. A plugin's
 /// rows answer ALLOW or nothing: any other verdict of theirs is no match.
 pub fn policy(mode: Mode, n: u64, ppoll_max: u64, gate: u64, fs: Fs, net: bool) -> impl Fn(&seccomp_data) -> u32 {
-    let core = filter::policy(mode, n, ppoll_max, gate);
+    let core = filter::policy(mode, ppoll_max, gate);
     let files = fs::policy(n, fs == Fs::ReadWrite);
     let sockets = net::policy(n);
     move |d| {
@@ -105,7 +105,7 @@ pub fn policy(mode: Mode, n: u64, ppoll_max: u64, gate: u64, fs: Fs, net: bool) 
 /// and inside it, so the parts concatenate. Not trusted: the proof checks the joined program.
 pub fn filter(mode: Mode, n: u64, ppoll_max: u64, gate: u64, fs: Fs, net: bool) -> Vec<sock_filter> {
     let mut prog = vec![];
-    append(&mut prog, filter::filter(mode, n, ppoll_max, gate), |i| ret_k(i) == Some(NO_MATCH));
+    append(&mut prog, filter::filter(mode, ppoll_max, gate), |i| ret_k(i) == Some(NO_MATCH));
     if fs != Fs::Off {
         append(&mut prog, fs::filter(n, fs == Fs::ReadWrite), |i| is_ret(i) && ret_k(i) != Some(SECCOMP_RET_ALLOW));
     }

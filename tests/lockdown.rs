@@ -7,7 +7,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 use unsharek_tcb::plugin::{Files, Net};
-use unsharek_tcb::{Config, Error, Fds, Mode};
+use unsharek_tcb::{Config, Error, Mode};
 
 // ------------------------------------------------------------------------------------------------
 // A gate, and a SIGSYS handler that returns through it.
@@ -104,11 +104,52 @@ fn lockdown(guest: &Guest, grants: impl FnOnce(&mut Config)) -> unsharek_tcb::Re
     with_plugins(guest, grants, &[])
 }
 
-/// [`lockdown`], with `plugins`.
+/// [`lockdown`], with `plugins`. The kept fds are first put at `0..n`, as a caller does
+/// ([`arrange`]), the config's numbers changed to theirs.
 fn with_plugins(guest: &Guest, grants: impl FnOnce(&mut Config), plugins: &[&dyn unsharek_tcb::Plugin]) -> unsharek_tcb::Result<Fds> {
     let mut c = Config::new().mode(guest.mode).guest_fds(mode_fds(guest.mode, &guest.fds)).gate(gate_ip());
     grants(&mut c);
-    unsharek_tcb::lockdown(c, plugins)
+    let fds = arrange(&c.fds.iter().chain(&c.guest_fds).copied().collect::<Vec<_>>());
+    c.fds = c.fds.iter().map(|&fd| fds.get(fd).unwrap()).collect();
+    c.guest_fds = c.guest_fds.iter().map(|&fd| fds.get(fd).unwrap()).collect();
+    unsharek_tcb::lockdown(c, plugins).map(|()| fds)
+}
+
+/// The kept fds as the test's caller arranged them: their count `n`, and each one's new number.
+struct Fds {
+    n: RawFd,
+    /// (old, new), sorted by the old number.
+    map: Vec<(RawFd, RawFd)>,
+}
+
+impl Fds {
+    fn get(&self, old: RawFd) -> Option<RawFd> {
+        self.map.binary_search_by_key(&old, |&(o, _)| o).ok().map(|i| self.map[i].1)
+    }
+}
+
+/// What a caller does before lockdown (unsharek's setup, untrusted): each kept fd moved to
+/// `0..n`, those already below `n` in place, the others to the free numbers below it, lowest
+/// first (a stray fd there is replaced; lockdown closes the old numbers, at or above `n`).
+/// A kept fd that isn't open stays where it is, for lockdown to refuse.
+fn arrange(keep: &[RawFd]) -> Fds {
+    let mut keep = keep.to_vec();
+    keep.sort_unstable();
+    keep.dedup();
+    let n = keep.len() as RawFd;
+    let mut free = (0..n).filter(|fd| keep.binary_search(fd).is_err());
+    let mut map = vec![];
+    for &fd in &keep {
+        // SAFETY: fcntl on this process's fd.
+        let open = unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0;
+        let new = if fd < n || !open { fd } else { free.next().unwrap() };
+        if new != fd {
+            // SAFETY: dup3 of this process's own fd onto a number not kept.
+            assert_eq!(unsafe { libc::dup3(fd, new, 0) }, new);
+        }
+        map.push((fd, new));
+    }
+    Fds { n, map }
 }
 
 /// `fds` and what the mode keeps besides: threaded and fork mode's TOKEN_FDS eventfds (`fds`'
@@ -446,14 +487,15 @@ fn refuses_a_second_thread() {
     assert_eq!(got, 0);
 }
 
-/// A granted fd that isn't open is an error, not a grant of whatever opens there later.
+/// A granted fd that isn't open (in `0..n`: no gap) is an error, not a grant of whatever opens
+/// there later.
 #[test]
 fn refuses_a_closed_grant() {
     let got = exit_code(in_child(|| {
-        match lockdown(&Guest { fds: vec![], mode: Mode::Coroutine }, |s| {
-            s.fds.extend([900]);
-        }) {
-            Err(Error::NotOpen(900)) => 0,
+        // SAFETY: closes fd 3, this process's.
+        unsafe { libc::close(3) };
+        match unsharek_tcb::lockdown(Config::new().grant([0, 1, 2, 3]).gate(gate_ip()), &[]) {
+            Err(Error::NotOpen(3)) => 0,
             _ => 1,
         }
     }));
@@ -461,138 +503,53 @@ fn refuses_a_closed_grant() {
 }
 
 // ------------------------------------------------------------------------------------------------
-// Renumbering (compaction): the kept fds at 0..n.
+// The kept fds: exactly 0..n, the caller's to arrange.
 
-/// `fd` duplicated to `at` (closed first if open), close-on-exec if `cloexec`.
-fn dup_to(fd: RawFd, at: RawFd, cloexec: bool) -> RawFd {
-    // SAFETY: dup3 of our own fd.
-    let r = unsafe { libc::dup3(fd, at, if cloexec { libc::O_CLOEXEC } else { 0 }) };
-    assert_eq!(r, at);
-    at
-}
-
-/// Kept fds scattered above stray ones land at 0..n: 0-2 in place, the rest lowest-first in
-/// order of the old numbers, close-on-exec as they were; each still the same file (a write on
-/// the new number reaches the pipe's other end); n and everything above it closed.
+/// A gap in the kept fds (fd 3 not kept, 4 is): refused, naming it. Lockdown renumbers nothing.
 #[test]
-fn renumbers_the_kept_fds() {
-    // Coroutine mode: no guest fds of its own, so the numbers below are all the test's.
-    {
-        let mode = Mode::Coroutine;
-        let code = exit_code(in_child(|| {
-            let mut p = [0; 2];
-            // SAFETY: a pipe into a local.
-            assert_eq!(unsafe { libc::pipe(p.as_mut_ptr()) }, 0);
-            // Strays at 20 and 30, kept ones at 500 (cloexec), 700, 800 (the read end, so the
-            // writes don't break the pipe) and an eventfd at 600.
-            let _stray = (dup_to(p[0], 20, false), dup_to(p[0], 30, false));
-            let w = dup_to(p[1], 500, true);
-            let w2 = dup_to(p[1], 700, false);
-            let r = dup_to(p[0], 800, false);
-            let efd = dup_to(eventfd(), 600, false);
-            let Ok(f) = lockdown(&Guest { fds: vec![], mode }, |s| s.fds.extend([0, 1, 2, w, w2, r, efd])) else {
-                return 1;
-            };
-            // n = 7: 0, 1, 2 stay; 500 -> 3, 600 -> 4, 700 -> 5, 800 -> 6.
-            let want = Fds { n: 7, map: vec![(0, 0), (1, 1), (2, 2), (w, 3), (efd, 4), (w2, 5), (r, 6)] };
-            if f != want {
-                return 2;
-            }
-            let msg = *b"hi";
-            if g(libc::SYS_write, [3, msg.as_ptr() as usize, 1]) != 1 || g(libc::SYS_write, [5, msg[1..].as_ptr() as usize, 1]) != 1 {
-                return 3;
-            }
-            let one = 1u64.to_ne_bytes();
-            if g(libc::SYS_write, [4, one.as_ptr() as usize, 8]) != 8 {
-                return 4;
-            }
-            let mut got = [0u8; 2];
-            if g(libc::SYS_read, [6, got.as_mut_ptr() as usize, 2]) != 2 || got != msg {
-                return 6;
-            }
-            // 7 and the old numbers are closed: POLLNVAL.
-            let mut pfd: Vec<libc::pollfd> = [7, 20, 500, 600, 700].iter().map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }).collect();
-            let ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-            // SAFETY: ppoll from the gate on five pollfds, no mask.
-            let r = unsafe { gate(libc::SYS_ppoll as usize, pfd.as_mut_ptr() as usize, 5, &ts as *const _ as usize, 0, 8, 0) };
-            if r != 5 || pfd.iter().any(|p| p.revents & libc::POLLNVAL == 0) {
-                return 5;
-            }
-            0
-        }));
-        assert_eq!(code, 0, "{mode:?}");
-    }
-    // Kept fds below the floor stay where they are, those above fill the gaps.
-    let code = exit_code(in_child(|| {
+fn refuses_a_gap() {
+    let got = exit_code(in_child(|| {
         let mut p = [0; 2];
-        // SAFETY: a pipe into a local.
+        // SAFETY: a pipe, its write end moved to 4, 3 closed.
+        unsafe {
+            assert_eq!(libc::pipe(p.as_mut_ptr()), 0);
+            assert_eq!(libc::dup2(p[1], 4), 4);
+            libc::close(3);
+        }
+        match unsharek_tcb::lockdown(Config::new().grant([0, 1, 2, 4]).gate(gate_ip()), &[]) {
+            Err(Error::Gap { gap: 3, n: 4 }) => 0,
+            _ => 1,
+        }
+    }));
+    assert_eq!(got, 0);
+}
+
+/// An fd at or above `n` is closed, not an error (a CLI inherits stray fds): after lockdown the
+/// gate's ppoll sees it gone (POLLNVAL), and the kept pipe still works.
+#[test]
+fn closes_fds_at_or_above_n() {
+    let got = exit_code(in_child(|| {
+        let mut p = [0; 2];
+        // SAFETY: a pipe.
         assert_eq!(unsafe { libc::pipe(p.as_mut_ptr()) }, 0);
-        let (a, b) = (dup_to(p[1], 400, true), dup_to(p[1], 401, false));
-        let Ok(f) = lockdown(&Guest { fds: vec![], mode: Mode::Coroutine }, |s| s.fds.extend([p[0], a, b])) else {
+        // SAFETY: dup of this process's fd far above.
+        let stray = unsafe { libc::dup2(p[0], 700) };
+        let Ok(f) = lockdown(&Guest { fds: vec![], mode: Mode::Coroutine }, |s| s.fds.extend([p[0], p[1]])) else {
             return 1;
         };
-        let (r, a, b) = (f.get(p[0]).unwrap(), f.get(a).unwrap(), f.get(b).unwrap());
-        if f.n != 3 || ![r, a, b].iter().all(|&fd| fd < 3) {
+        let (r, w) = (f.get(p[0]).unwrap(), f.get(p[1]).unwrap());
+        let mut pfd = [libc::pollfd { fd: stray, events: libc::POLLIN, revents: 0 }];
+        let ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        if g(libc::SYS_ppoll, [pfd.as_mut_ptr() as usize, 1, &ts as *const _ as usize]) != 1 || pfd[0].revents != libc::POLLNVAL {
             return 2;
         }
-        let x = *b"x";
-        if g(libc::SYS_write, [a as usize, x.as_ptr() as usize, 1]) != 1 {
-            return 3;
-        }
-        let mut got = [0u8];
-        if g(libc::SYS_read, [r as usize, got.as_mut_ptr() as usize, 1]) != 1 || got != x {
-            return 4;
-        }
-        0
-    }));
-    assert_eq!(code, 0);
-}
-
-/// Granted fds already at 0..n: nothing moves (0-2 in place, duplicates counted once).
-#[test]
-fn renumbering_leaves_low_fds_in_place() {
-    let code = exit_code(in_child(|| {
-        // Every fd but 0-2 closed first: the kept ones are already 0..n.
-        // SAFETY: closing our own fds.
-        unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) };
-        let Ok(f) = lockdown(&Guest { fds: vec![], mode: Mode::Coroutine }, |s| s.fds.extend([2, 0, 1, 1])) else {
-            return 1;
-        };
-        if f != (Fds { n: 3, map: vec![(0, 0), (1, 1), (2, 2)] }) {
-            return 2;
-        }
-        0
-    }));
-    assert_eq!(code, 0);
-}
-
-/// A huge fd number costs nothing (before, the plugin's floor filled every number below it with
-/// /dev/null): it moves to 0.
-#[test]
-fn renumbers_a_huge_fd() {
-    let code = exit_code(in_child(|| {
-        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-        // SAFETY: get and set our own fd limit.
-        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) };
-        lim.rlim_cur = lim.rlim_max.min(1 << 20);
-        // SAFETY: as above.
-        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) };
-        let huge = (lim.rlim_cur - 1) as RawFd;
-        let efd = dup_to(eventfd(), huge, false);
-        let t = std::time::Instant::now();
-        let Ok(f) = lockdown(&Guest { fds: vec![], mode: Mode::Coroutine }, |s| s.fds.push(efd)) else {
-            return 1;
-        };
-        if f != (Fds { n: 1, map: vec![(huge, 0)] }) || t.elapsed() > std::time::Duration::from_millis(500) {
-            return 2;
-        }
-        let one = 1u64.to_ne_bytes();
-        if g(libc::SYS_write, [0, one.as_ptr() as usize, 8]) != 8 {
+        let mut b = [0u8; 1];
+        if r >= f.n || w >= f.n || g(libc::SYS_write, [w as usize, b"x".as_ptr() as usize, 1]) != 1 || g(libc::SYS_read, [r as usize, b.as_mut_ptr() as usize, 1]) != 1 {
             return 3;
         }
         0
     }));
-    assert_eq!(code, 0);
+    assert_eq!(got, 0);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -886,7 +843,9 @@ fn guest_fds_are_the_modes() {
     use unsharek_tcb::TOKEN_FDS;
     let refused = |mode: Mode, fds: fn() -> Vec<RawFd>| {
         exit_code(in_child(move || {
-            let c = Config::new().mode(mode).guest_fds(fds()).gate(gate_ip());
+            let fds = fds();
+            let f = arrange(&fds);
+            let c = Config::new().mode(mode).guest_fds(fds.iter().map(|&fd| f.get(fd).unwrap())).gate(gate_ip());
             match unsharek_tcb::lockdown(c, &[]) {
                 Err(Error::GuestFds { .. } | Error::FdKind { .. }) => 0,
                 Ok(_) => 1,

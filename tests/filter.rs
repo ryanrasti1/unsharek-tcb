@@ -32,7 +32,12 @@ fn call(nr: i64, args: [u64; 6]) -> seccomp_data {
 
 /// Whether `d` is allowed with these plugins (threaded mode, floor N).
 fn allowed(fs: Fs, net: bool, d: &seccomp_data) -> bool {
-    policy(Mode::Threaded, N, PPOLL_FDS, GATE, fs, net)(d) == RET_ALLOW
+    allowed_in(Mode::Threaded, fs, net, d)
+}
+
+/// [`allowed`], in `mode`.
+fn allowed_in(mode: Mode, fs: Fs, net: bool, d: &seccomp_data) -> bool {
+    policy(mode, N, PPOLL_FDS, GATE, fs, net)(d) == RET_ALLOW
 }
 
 /// The numbers [`policy`] allows in `mode` without plugins, for some arguments: every x86-64
@@ -196,29 +201,19 @@ fn filter_length() {
     }
 }
 
-/// `read` and `write` on a kept fd (below the floor) only, as an int; with a plugin on one it
-/// opened too (at or above it), never with a high bit set. `kill` never: a death by a signal is
-/// the runtime's exit_group(128 + n).
+/// `read` and `write` on any fd: only kept ones are open (lockdown leaves exactly `0..n`), and
+/// with a plugin the ones its rows make. `kill` never: a death by a signal is the runtime's
+/// exit_group(128 + n).
 #[test]
-fn read_write_below_the_floor() {
+fn read_write_any_fd() {
     for mode in MODES {
-        let without = |d: &seccomp_data| policy(mode, N, PPOLL_FDS, GATE, Fs::Off, false)(d);
-        for nr in [libc::SYS_read, libc::SYS_write] {
-            for fd in [0, 1, 2, N - 1] {
-                assert_eq!(without(&call(nr, [fd, 0, 0, 0, 0, 0])), RET_ALLOW, "{mode:?} {nr} {fd}");
-            }
-            for fd in [N, N + 1, 1000, (1 << 32) | 1, u64::MAX] {
-                assert_ne!(without(&call(nr, [fd, 0, 0, 0, 0, 0])), RET_ALLOW, "{mode:?} {nr} {fd:#x}");
-            }
-            for (fs, net) in [(Fs::ReadOnly, false), (Fs::Off, true)] {
-                let with = |d: &seccomp_data| policy(mode, N, PPOLL_FDS, GATE, fs, net)(d);
-                assert_eq!(with(&call(nr, [1000, 0, 0, 0, 0, 0])), RET_ALLOW, "{mode:?}: an opened fd");
-                for fd in [1u64 << 31, (1 << 32) | 1, u64::MAX] {
-                    assert_ne!(with(&call(nr, [fd, 0, 0, 0, 0, 0])), RET_ALLOW, "{mode:?} {nr} {fd:#x}");
+        for (fs, net) in [(Fs::Off, false), (Fs::ReadOnly, false), (Fs::Off, true)] {
+            for nr in [libc::SYS_read, libc::SYS_write] {
+                for fd in [0, 1, 2, N - 1, N, 1000, u64::MAX] {
+                    assert!(allowed_in(mode, fs, net, &call(nr, [fd, 0, 0, 0, 0, 0])), "{mode:?} {nr} {fd:#x}");
                 }
             }
         }
-        assert_ne!(policy(mode, 0, PPOLL_FDS, GATE, Fs::Off, false)(&call(libc::SYS_read, [0; 6])), RET_ALLOW);
         for (fs, net) in [(Fs::Off, false), (Fs::ReadWrite, true)] {
             assert!(!allowed(fs, net, &call(libc::SYS_kill, [4242, 9, 0, 0, 0, 0])), "kill");
             assert!(!allowed(fs, net, &call(libc::SYS_recvmsg, [N, 0, libc::MSG_CMSG_CLOEXEC as u64, 0, 0, 0])), "recvmsg");

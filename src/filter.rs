@@ -48,14 +48,13 @@ pub const CLONE_THREAD_FLAGS: u64 = (libc::CLONE_VM
 pub const PPOLL_FDS: u64 = 8;
 
 /// The core's verdict on a call `d`: README.md's core table, a row per row, in its order. Each
-/// row widens what a compromised program can do through the gate, so each says why. `n` is the
-/// fd floor ([`crate::Fds::n`]): lockdown leaves the kept fds, and only them, at `0..n`; an fd at
-/// or above `n` can only be one a plugin's row made after lockdown (the kernel gives the lowest
-/// free number). The core knows no plugin: a call its rows don't allow is [`NO_MATCH`], which
+/// row widens what a compromised program can do through the gate, so each says why. The core's
+/// rows take no fd floor: without a plugin no row makes an fd, so every open fd is a kept one
+/// (lockdown leaves exactly those, at `0..n`). The core knows no plugin: a call its rows don't allow is [`NO_MATCH`], which
 /// the composition (`crate::plugin::policy`) gives to the enabled plugins' rows, and else kills.
 /// The arch and gate checks come first and are final: no plugin row sees another ABI's call or
 /// the program's.
-pub fn policy(mode: Mode, n: u64, ppoll_max: u64, gate: u64) -> impl Fn(&seccomp_data) -> u32 {
+pub fn policy(mode: Mode, ppoll_max: u64, gate: u64) -> impl Fn(&seccomp_data) -> u32 {
     move |d| {
         // Another ABI: the rows know only x86-64's numbers, and must not judge another's.
         if d.arch != AUDIT_ARCH_X86_64 || d.nr as u32 >= X32_SYSCALL_BIT {
@@ -68,8 +67,9 @@ pub fn policy(mode: Mode, n: u64, ppoll_max: u64, gate: u64) -> impl Fn(&seccomp
         let threads = mode != Mode::Coroutine;
         let fork = mode == Mode::Fork;
         match d.nr as i64 {
-            // A kept fd (below `n`), as its own mode allows.
-            SYS_read | SYS_write if d.args[0] < n => SECCOMP_RET_ALLOW,
+            // Any fd: only kept ones are open (and, with a plugin, the ones its rows make), each as
+            // its own mode allows.
+            SYS_read | SYS_write => SECCOMP_RET_ALLOW,
             // Readiness only, at most `ppoll_max` fds; no signal mask (it could unblock SIGSYS).
             SYS_ppoll if d.args[1] <= ppoll_max && d.args[3] == 0 => SECCOMP_RET_ALLOW,
             // The end of the process; the SIGSYS handler's return, and a new host thread's start.
@@ -98,6 +98,6 @@ pub fn policy(mode: Mode, n: u64, ppoll_max: u64, gate: u64) -> impl Fn(&seccomp
 
 /// The core's program ([`policy`]'s, `NO_MATCH` included: the composition turns it into the
 /// plugins' turn). Public, so the exact program can be inspected and tested.
-pub fn filter(mode: Mode, n: u64, ppoll_max: u64, gate: u64) -> Vec<sock_filter> {
-    seccomp_fn::bpf!(policy(mode, n, ppoll_max, gate))
+pub fn filter(mode: Mode, ppoll_max: u64, gate: u64) -> Vec<sock_filter> {
+    seccomp_fn::bpf!(policy(mode, ppoll_max, gate))
 }

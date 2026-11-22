@@ -17,8 +17,7 @@
 //!     .grant([0, 1, 2])      // kept, read and write only
 //!     .guest_fds([token_fd]) // the guest's own: kind-checked
 //!     .gate(gate);           // the one instruction host calls may come from
-//! let fds = lockdown(c, &[])?; // the kept fds, renumbered 0..n; no plugins
-//! let token_fd = fds.get(token_fd).unwrap();
+//! lockdown(c, &[])?;         // the kept fds are exactly 0..n (the caller's); no plugins
 //! // Locked down: run the program.
 //! # Ok::<(), unsharek_tcb::Error>(())
 //! ```
@@ -152,8 +151,9 @@ impl Config {
     }
 
     /// Keep `fds` open past lockdown; every other fd is closed. Fds 0-2 are granted like any other
-    /// (none is by default). Lockdown checks each is open, and renumbers the kept fds `0..n`
-    /// ([`Fds`]: a kept fd already below `n`, as 0-2 when granted, keeps its number). What may be done on one is `read` and
+    /// (none is by default). The kept fds (these and [`Config::guest_fds`]) must be exactly
+    /// `0..n`, contiguous: putting them there is the caller's (its `dup2`s, untrusted; lockdown
+    /// renumbers nothing and refuses a gap), and lockdown checks each is open. What may be done on one is `read` and
     /// `write`, as its own mode allows (an `O_RDONLY` file can't be written; a pipe end is one-way),
     /// and nothing else (no `ioctl`, no `sendmsg`, no `close`). A two-way fd the program should only
     /// write (a terminal as stdout) is the caller's to reopen one-way first.
@@ -204,6 +204,8 @@ pub enum Error {
     Threads(Vec<i32>),
     /// A granted fd isn't open.
     NotOpen(RawFd),
+    /// The kept fds aren't `0..n`: `gap` is below their count `n` and not one of them.
+    Gap { gap: RawFd, n: RawFd },
     /// A guest fd of a kind it can't be (its `/proc/self/fd` link).
     FdKind { fd: RawFd, kind: String },
     /// The guest's fds aren't the mode's: their eventfds and pidfds counted ([`Config::guest_fds`]).
@@ -234,6 +236,7 @@ impl fmt::Display for Error {
                 tids.len()
             ),
             Error::NotOpen(fd) => write!(f, "granted fd {fd} is not open"),
+            Error::Gap { gap, n } => write!(f, "the kept fds aren't 0..{n}: {gap} isn't one (the caller puts them there, contiguous)"),
             Error::FdKind { fd, kind } => {
                 write!(f, "the guest's fd {fd} is {kind:?}, not an eventfd or a pidfd")
             }
@@ -256,39 +259,19 @@ impl std::error::Error for Error {}
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// The kept fds after lockdown: the grants and the guest's own, renumbered `0..n` in place. A
-/// kept fd below `n` keeps its number (0-2, when granted); each one at or above it moves to a
-/// free number below (lowest first, in order of the old numbers), close-on-exec as it was. So
-/// the filter's `fd < n` is exactly the kept fds, whatever numbers they had (no placeholder
-/// fills a gap, and a huge fd costs nothing).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Fds {
-    /// The floor: the number of kept fds.
-    pub n: RawFd,
-    /// (old, new) for every kept fd, sorted by the old number.
-    pub map: Vec<(RawFd, RawFd)>,
-}
-
-impl Fds {
-    /// The new number of kept fd `old`; `None` if it wasn't kept.
-    pub fn get(&self, old: RawFd) -> Option<RawFd> {
-        self.map.binary_search_by_key(&old, |&(o, _)| o).ok().map(|i| self.map[i].1)
-    }
-}
-
 /// Lock the process down with `config`, and nothing else. In this order:
 ///
 /// 0. with [`Config::paranoia`], its assumptions checked (the crate's "Assumptions");
 /// 1. exactly one thread, the caller's (`/proc/self/task`, read through one fd of `/proc/self`,
 ///    checked to be procfs; a thread just joined gets a few ms to vanish). Every check after
 ///    this one can't be raced;
-/// 2. the guest's own fds ([`Config::guest_fds`]) kind-checked: eventfds, and pidfds in fork
-///    mode only; every granted fd open;
+/// 2. the kept fds (granted and the guest's) exactly `0..n` (a gap refused, before anything:
+///    renumbering is the caller's); the guest's own ([`Config::guest_fds`]) kind-checked:
+///    eventfds, and pidfds in fork mode only, the mode's count; every granted fd open;
 /// 3. every mapping kind-checked (`/proc/self/maps`): private, or shared and read-only, or (in
 ///    fork mode) shared anonymous memory (the kernel's shmem); above all no writable shared
 ///    mapping of a host file;
-/// 4. every fd neither granted nor the guest's closed (not refused: a CLI inherits stray fds),
-///    and the kept ones renumbered `0..n` ([`Fds`]);
+/// 4. every fd at or above `n` closed (not refused: a CLI inherits stray fds);
 /// 5. no core dump (`RLIMIT_CORE` 0) and not dumpable (`PR_SET_DUMPABLE` 0): a crash makes the
 ///    host write none of the process's memory, nor start `core_pattern`'s helper;
 /// 6. every capability dropped (bounding where permitted, ambient, effective, permitted,
@@ -304,11 +287,11 @@ impl Fds {
 /// A caller that wants more restrictions installs its own seccomp filter before this: filters
 /// stack, the strictest answer wins (it must let lockdown's own calls through).
 ///
-/// On success the process is locked down ([`locked_down`]); the caller uses the kept fds' new
-/// numbers ([`Fds::get`]) and hands over to the program. On failure nothing untrusted has run
-/// (the fds may have been renumbered already: the caller reports the error and ends).
-pub fn lockdown(config: Config, plugins: &[&dyn Plugin]) -> Result<Fds> {
-    let fds = lockdown::lockdown(config, plugins)?;
+/// On success the process is locked down ([`locked_down`]); the caller hands over to the
+/// program. On failure nothing untrusted has run (the fds at or above `n` may be closed already:
+/// the caller reports the error and ends).
+pub fn lockdown(config: Config, plugins: &[&dyn Plugin]) -> Result<()> {
+    lockdown::lockdown(config, plugins)?;
     LOCKED.store(true, std::sync::atomic::Ordering::SeqCst);
-    Ok(fds)
+    Ok(())
 }

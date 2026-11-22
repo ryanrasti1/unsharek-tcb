@@ -15,7 +15,7 @@ use rustix::process::{DumpableBehavior, Resource, Rlimit};
 use rustix::thread::{CapabilitySet, CapabilitySets};
 
 use crate::plugin::{self, Plugin};
-use crate::{Config, Error, Fds, Mode, Result};
+use crate::{Config, Error, Mode, Result};
 
 fn os(what: &'static str) -> impl FnOnce(io::Error) -> Error {
     move |source| Error::Os { what, source }
@@ -47,20 +47,23 @@ pub fn paranoia_ns() -> u64 {
     PARANOIA_NS.load(Ordering::Relaxed)
 }
 
-pub(crate) fn lockdown(config: Config, plugins: &[&dyn Plugin]) -> Result<Fds> {
+pub(crate) fn lockdown(config: Config, plugins: &[&dyn Plugin]) -> Result<()> {
     let mode = config.mode;
     let gate = config.gate.ok_or(Error::NoGate)?;
     let guest_fds: Vec<RawFd> = config.guest_fds.clone();
     // A plugin's kept fds are kept as grants are.
     let grants: Vec<RawFd> = config.fds.iter().copied().chain(plugins.iter().flat_map(|p| p.kept().iter().map(|k| k.0))).collect();
-    // The kept fds: the grants and the guest's, and their new numbers. The filter is compiled
-    // first (it allocates, and checks nothing), for the floor `n`.
+    // The kept fds: the grants and the guest's, exactly 0..n (the caller put them there: no
+    // renumbering here). The filter is compiled first (it allocates, and checks nothing).
     let mut keep: Vec<RawFd> = grants.iter().chain(&guest_fds).copied().collect();
     keep.sort_unstable();
     keep.dedup();
-    let fds = renumbered(&keep);
+    let n = keep.len() as RawFd;
+    if let Some(gap) = (0..n).find(|fd| keep.binary_search(fd).is_err()) {
+        return Err(Error::Gap { gap, n });
+    }
     let (fs, net) = plugin::rows(plugins);
-    let prog = plugin::filter(mode, fds.n as u64, config.ppoll_max, gate, fs, net);
+    let prog = plugin::filter(mode, n as u64, config.ppoll_max, gate, fs, net);
     // What the plugins need of the kernel (the file plugin's Landlock): refused now, before
     // anything changes, if not there.
     for p in plugins {
@@ -71,7 +74,7 @@ pub(crate) fn lockdown(config: Config, plugins: &[&dyn Plugin]) -> Result<Fds> {
         // Every read of /proc is through this one fd, checked to be the kernel's procfs (not
         // whatever is mounted at /proc: a FUSE or tmpfs there could answer anything), and its
         // process to be this one (step 1 finds this thread's tid in it). Closed before step 4.
-        let proc = proc_self()?;
+        let proc = proc_self(n)?;
         // 0. The assumptions, best-effort.
         if config.paranoia {
             let t = Instant::now();
@@ -111,8 +114,9 @@ pub(crate) fn lockdown(config: Config, plugins: &[&dyn Plugin]) -> Result<Fds> {
             return Err(Error::GuestFds { mode, eventfds, pidfds });
         }
         for &fd in &grants {
-            // Open: /proc/self/fd has it, as for the guest's (no fd borrowed unsafely).
-            if fd < 0 || fd_kind(&proc, fd).is_err() {
+            // Open (F_GETFD), and /proc/self/fd has it, as for the guest's.
+            // SAFETY: fcntl on this process's fd.
+            if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 || fd_kind(&proc, fd).is_err() {
                 return Err(Error::NotOpen(fd));
             }
         }
@@ -120,10 +124,13 @@ pub(crate) fn lockdown(config: Config, plugins: &[&dyn Plugin]) -> Result<Fds> {
         check_maps(&proc, mode)?;
         CHECK_NS.store(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
-    // 4. Every other fd closed, not refused (a CLI inherits stray fds), and the kept ones moved
-    // to `0..n`.
-    close_except(&keep)?;
-    compact(&fds)?;
+    // 4. Every fd at or above `n` closed, /proc's among them (not refused: a CLI inherits stray
+    // fds). After it, no row frees a number below `n` (no close of one, no dup), so by the
+    // kernel's lowest-free rule every fd made later is at or above `n`.
+    // SAFETY: closes this process's fds at or above `n`: none is kept.
+    if unsafe { libc::syscall(libc::SYS_close_range, n as u32, u32::MAX, 0) } != 0 {
+        return Err(last_os("close_range"));
+    }
     // 5. No core dump, not dumpable.
     rustix::process::setrlimit(Resource::Core, Rlimit { current: Some(0), maximum: Some(0) }).map_err(rx("RLIMIT_CORE"))?;
     rustix::process::set_dumpable_behavior(DumpableBehavior::NotDumpable).map_err(rx("PR_SET_DUMPABLE"))?;
@@ -138,56 +145,17 @@ pub(crate) fn lockdown(config: Config, plugins: &[&dyn Plugin]) -> Result<Fds> {
     }
     // 8. The filter, with TSYNC.
     install(&prog)?;
-    Ok(fds)
-}
-
-/// The kept fds' new numbers (`keep` sorted, deduplicated): those below `n` stay, the others
-/// take the free numbers below `n`, lowest first, in order.
-fn renumbered(keep: &[RawFd]) -> Fds {
-    let n = keep.len() as RawFd;
-    let mut free = (0..n).filter(|fd| keep.binary_search(fd).is_err());
-    let map = keep.iter().map(|&fd| (fd, if fd < n { fd } else { free.next().unwrap_or(fd) })).collect();
-    Fds { n, map }
-}
-
-/// Step 4's moves: each kept fd at or above `n` duplicated to its new number (close-on-exec as
-/// it was), then everything at or above `n` closed. After [`close_except`], so every new number
-/// is free; each is checked open after.
-fn compact(fds: &Fds) -> Result<()> {
-    for &(old, new) in &fds.map {
-        if old == new {
-            continue;
-        }
-        // SAFETY: fcntl and dup3 on this process's fds; `new` is free (step 4 closed it).
-        let fl = unsafe { libc::fcntl(old, libc::F_GETFD) };
-        if fl < 0 {
-            return Err(last_os("F_GETFD"));
-        }
-        let cloexec = if fl & libc::FD_CLOEXEC != 0 { libc::O_CLOEXEC } else { 0 };
-        // SAFETY: as above.
-        if unsafe { libc::dup3(old, new, cloexec) } != new {
-            return Err(last_os("dup3"));
-        }
-    }
-    let n = fds.n as u32;
-    // SAFETY: closes this process's fds at or above `n`: none is kept any more.
-    if unsafe { libc::syscall(libc::SYS_close_range, n, u32::MAX, 0) } != 0 {
-        return Err(last_os("close_range"));
-    }
-    for fd in 0..fds.n {
-        // SAFETY: fcntl on this process's fd.
-        if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
-            return Err(Error::NotOpen(fd));
-        }
-    }
     Ok(())
 }
 
 /// `/proc/self`, opened once: a directory on procfs (`PROC_SUPER_MAGIC`).
-fn proc_self() -> Result<OwnedFd> {
+fn proc_self(n: RawFd) -> Result<OwnedFd> {
     const PROC_SUPER_MAGIC: i64 = 0x9fa0;
-    let proc = rustix::fs::open("/proc/self", OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, FsMode::empty())
+    let open = rustix::fs::open("/proc/self", OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, FsMode::empty())
         .map_err(rx("/proc/self"))?;
+    // At or above `n`: below it, in a kept fd's number closed, it would pass for that fd.
+    let proc = rustix::io::fcntl_dupfd_cloexec(&open, n).map_err(rx("/proc/self"))?;
+    drop(open);
     let st = rustix::fs::fstatfs(&proc).map_err(rx("/proc/self"))?;
     if st.f_type as i64 != PROC_SUPER_MAGIC {
         return Err(Error::Os { what: "/proc", source: io::Error::other(format!("not procfs (f_type {:#x})", st.f_type)) });
@@ -319,23 +287,6 @@ fn paranoia(proc: &OwnedFd, mode: Mode, keep: &[RawFd]) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Step 4: `close_range` between and above `keep` (sorted, deduplicated).
-fn close_except(keep: &[RawFd]) -> Result<()> {
-    let close = |lo: u32, hi: u32| {
-        // SAFETY: closes fds of this process; the kept ones are outside the range.
-        if unsafe { libc::syscall(libc::SYS_close_range, lo, hi, 0) } != 0 { Err(last_os("close_range")) } else { Ok(()) }
-    };
-    let mut next: u32 = 0;
-    for &fd in keep {
-        let fd = fd as u32;
-        if fd > next {
-            close(next, fd - 1)?;
-        }
-        next = fd + 1;
-    }
-    close(next, u32::MAX)
 }
 
 /// Step 3: every line of `/proc/self/maps` is one of

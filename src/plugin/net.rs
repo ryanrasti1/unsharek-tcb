@@ -6,7 +6,7 @@
 use libc::{seccomp_data, sock_filter};
 use libc::{
     SYS_accept4, SYS_bind, SYS_close, SYS_connect, SYS_getpeername, SYS_getsockname, SYS_getsockopt, SYS_listen, SYS_ppoll,
-    SYS_read, SYS_setsockopt, SYS_shutdown, SYS_socket, SYS_write,
+    SYS_setsockopt, SYS_shutdown, SYS_socket,
 };
 use libc::{SECCOMP_RET_ALLOW, SECCOMP_RET_KILL_PROCESS};
 
@@ -51,8 +51,6 @@ impl Plugin for Net {
 pub(super) fn policy(n: u64) -> impl Fn(&seccomp_data) -> u32 {
     move |d| {
         match d.nr as i64 {
-            // A socket this plugin made (at or above `n`; a kept fd is the core's row).
-            SYS_read | SYS_write if d.args[0] >= n && d.args[0] <= INT_MAX => SECCOMP_RET_ALLOW,
             // Readiness of up to `Net::PPOLL_FDS` fds (the guest's sockets); no signal mask (it
             // could unblock SIGSYS).
             SYS_ppoll if d.args[1] <= Net::PPOLL_FDS && d.args[3] == 0 => SECCOMP_RET_ALLOW,
