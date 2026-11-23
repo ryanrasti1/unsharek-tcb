@@ -10,7 +10,10 @@ use std::os::fd::{OwnedFd, RawFd};
 
 use rustix::fs::{Mode as FsMode, OFlags};
 
-use crate::lockdown::{any, cap, capget, numbers_at, os, proc_self, read_at, rx};
+use rustix::io::Errno;
+use rustix::thread::{CapabilitySet, CapabilitySets};
+
+use crate::lockdown::{numbers_at, os, proc_self, read_at, rx};
 use crate::{Error, Expect, Mode, Result};
 
 /// The check, before lockdown closes anything: `keep` the kept fds, `0..n`, each as declared.
@@ -209,6 +212,50 @@ pub(crate) fn no_capabilities() -> Result<()> {
         if set {
             return Err(Error::Capabilities(format!("ambient capability {n} remains")));
         }
+    }
+    Ok(())
+}
+
+/// The process's capability sets (`capget`).
+pub(crate) fn capget() -> Result<CapabilitySets> {
+    rustix::thread::capabilities(None).map_err(rx("capget"))
+}
+
+/// Capability number `n`, as rustix takes one.
+pub(crate) fn cap(n: u32) -> CapabilitySet {
+    CapabilitySet::from_bits_retain(1 << n)
+}
+
+/// Any capability in any of the three sets.
+pub(crate) fn any(d: &CapabilitySets) -> bool {
+    !(d.effective | d.permitted | d.inheritable).is_empty()
+}
+
+/// The bounding set is dropped where the process may (it holds `CAP_SETPCAP`); an
+/// unprivileged process can't, and needn't: with nothing permitted, `no_new_privs` and no exec
+/// through the filter, the bounding set bounds nothing it could gain. Then ambient, effective,
+/// permitted and inheritable cleared (paranoia checks them empty after).
+pub(crate) fn drop_capabilities() -> Result<()> {
+    use rustix::thread::capability_is_in_bounding_set;
+    let d = capget()?;
+    if d.effective.contains(CapabilitySet::SETPCAP) {
+        for n in 0..64 {
+            // Reads the bounding set; EINVAL past the last capability.
+            let Ok(set) = capability_is_in_bounding_set(cap(n)) else { break };
+            if set {
+                rustix::thread::remove_capability_from_bounding_set(cap(n)).map_err(rx("PR_CAPBSET_DROP"))?;
+            }
+        }
+    }
+    // Clears the ambient set (EINVAL on kernels without it: none to clear).
+    match rustix::thread::clear_ambient_capability_set() {
+        Err(e) if e != Errno::INVAL => return Err(rx("PR_CAP_AMBIENT_CLEAR_ALL")(e)),
+        _ => {}
+    }
+    if any(&d) {
+        // Lowering every set is always permitted.
+        let none = CapabilitySets { effective: CapabilitySet::empty(), permitted: CapabilitySet::empty(), inheritable: CapabilitySet::empty() };
+        rustix::thread::set_capabilities(None, none).map_err(rx("capset"))?;
     }
     Ok(())
 }

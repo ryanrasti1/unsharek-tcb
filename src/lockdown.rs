@@ -12,7 +12,6 @@ use libc::sock_filter as SockFilter;
 use rustix::fs::{Mode as FsMode, OFlags};
 use rustix::io::Errno;
 use rustix::process::{DumpableBehavior, Resource, Rlimit};
-use rustix::thread::{CapabilitySet, CapabilitySets};
 
 use crate::plugin::Plugin;
 use crate::{Config, Error, Expect, Result, filter};
@@ -63,7 +62,7 @@ pub(crate) fn lockdown(config: Config, plugins: &[&dyn Plugin]) -> Result<()> {
     FD_NS.store(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     // The filter is compiled first (it allocates, and checks nothing).
     let rows = plugins.iter().map(|p| p.rows()).fold(crate::plugin::Rows::default(), |a, r| crate::plugin::Rows {
-        fs: a.fs.max(r.fs),
+        fs: a.fs.wider(r.fs),
         net: a.net || r.net,
     });
     let prog = filter::filter(mode, n as u64, config.gate, rows.fs, rows.net);
@@ -91,11 +90,12 @@ pub(crate) fn lockdown(config: Config, plugins: &[&dyn Plugin]) -> Result<()> {
     // 3. No core dump, not dumpable.
     rustix::process::setrlimit(Resource::Core, Rlimit { current: Some(0), maximum: Some(0) }).map_err(rx("RLIMIT_CORE"))?;
     rustix::process::set_dumpable_behavior(DumpableBehavior::NotDumpable).map_err(rx("PR_SET_DUMPABLE"))?;
-    // 4. Capabilities dropped (CAP_DAC_OVERRIDE would let the file plugin's openat read root-only
-    // files inside its roots; otherwise defence in depth), then no_new_privs: unprivileged
-    // seccomp needs it, and no exec gains anything after.
-    drop_capabilities()?;
+    // 4. Paranoia, best-effort: capabilities dropped (CAP_DAC_OVERRIDE would let the file
+    // plugin's openat read root-only files inside its roots; otherwise defence in depth), and
+    // checked gone. Then no_new_privs: unprivileged seccomp needs it, and no exec gains anything
+    // after.
     if config.paranoia {
+        crate::paranoia::drop_capabilities()?;
         crate::paranoia::no_capabilities()?;
     }
     rustix::thread::set_no_new_privs(true).map_err(rx("PR_SET_NO_NEW_PRIVS"))?;
@@ -142,50 +142,6 @@ pub(crate) fn numbers_at(dir: &OwnedFd, name: &str) -> io::Result<Vec<i32>> {
         }
     }
     Ok(out)
-}
-
-/// The process's capability sets (`capget`).
-pub(crate) fn capget() -> Result<CapabilitySets> {
-    rustix::thread::capabilities(None).map_err(rx("capget"))
-}
-
-/// Capability number `n`, as rustix takes one.
-pub(crate) fn cap(n: u32) -> CapabilitySet {
-    CapabilitySet::from_bits_retain(1 << n)
-}
-
-/// Any capability in any of the three sets.
-pub(crate) fn any(d: &CapabilitySets) -> bool {
-    !(d.effective | d.permitted | d.inheritable).is_empty()
-}
-
-/// Step 4. The bounding set is dropped where the process may (it holds `CAP_SETPCAP`); an
-/// unprivileged process can't, and needn't: with nothing permitted, `no_new_privs` and no exec
-/// through the filter, the bounding set bounds nothing it could gain. Then ambient, effective,
-/// permitted and inheritable cleared (paranoia checks them empty after).
-fn drop_capabilities() -> Result<()> {
-    use rustix::thread::capability_is_in_bounding_set;
-    let d = capget()?;
-    if d.effective.contains(CapabilitySet::SETPCAP) {
-        for n in 0..64 {
-            // Reads the bounding set; EINVAL past the last capability.
-            let Ok(set) = capability_is_in_bounding_set(cap(n)) else { break };
-            if set {
-                rustix::thread::remove_capability_from_bounding_set(cap(n)).map_err(rx("PR_CAPBSET_DROP"))?;
-            }
-        }
-    }
-    // Clears the ambient set (EINVAL on kernels without it: none to clear).
-    match rustix::thread::clear_ambient_capability_set() {
-        Err(e) if e != Errno::INVAL => return Err(rx("PR_CAP_AMBIENT_CLEAR_ALL")(e)),
-        _ => {}
-    }
-    if any(&d) {
-        // Lowering every set is always permitted.
-        let none = CapabilitySets { effective: CapabilitySet::empty(), permitted: CapabilitySet::empty(), inheritable: CapabilitySet::empty() };
-        rustix::thread::set_capabilities(None, none).map_err(rx("capset"))?;
-    }
-    Ok(())
 }
 
 /// `insns` installed (`SECCOMP_SET_MODE_FILTER`), with TSYNC on every thread of the process (a

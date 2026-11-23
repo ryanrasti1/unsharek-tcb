@@ -34,7 +34,7 @@ const RENAME_EXCHANGE: u32 = 2;
 
 /// A file plugin's access ([`Files::root`]): which rows the filter has, and which rights
 /// Landlock gives a root.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Fs {
     /// No file plugin: no row opens a file.
     #[default]
@@ -43,6 +43,17 @@ pub enum Fs {
     ReadOnly,
     /// Reading, writing, making and removing them.
     ReadWrite,
+}
+
+impl Fs {
+    /// The wider of two accesses: the rows that serve both.
+    pub fn wider(self, other: Fs) -> Fs {
+        match (self, other) {
+            (Fs::ReadWrite, _) | (_, Fs::ReadWrite) => Fs::ReadWrite,
+            (Fs::ReadOnly, _) | (_, Fs::ReadOnly) => Fs::ReadOnly,
+            (Fs::Off, Fs::Off) => Fs::Off,
+        }
+    }
 }
 
 /// The file plugin: roots, each read-only or read-write, confined by Landlock.
@@ -85,7 +96,7 @@ impl Files {
 
     /// The rows' access: the widest of the roots.
     fn access(&self) -> Fs {
-        self.roots.iter().map(|r| r.1).max().unwrap_or(Fs::Off)
+        self.roots.iter().fold(Fs::Off, |a, r| a.wider(r.1))
     }
 
     fn landlock(&self) -> bool {
