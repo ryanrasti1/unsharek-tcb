@@ -17,9 +17,9 @@
 //! syscall-user-dispatch rule is in it.
 #![allow(non_upper_case_globals)]
 
-use libc::{seccomp_data, sock_filter};
+use libc::seccomp_data;
 use seccomp_fn_verify::calls::{Call, CallExt};
-use seccomp_fn_verify::expr::{Cond, gated};
+use seccomp_fn_verify::tree::Tree;
 
 use crate::Mode;
 use crate::plugin::{Fs, fs, net};
@@ -74,9 +74,10 @@ pub fn core(d: &seccomp_data, threads: bool, fork: bool) -> bool {
     }
 }
 
-/// The whole filter's verdict on `d`, as [`filter`]'s program gives it: the combinator's
-/// ([`gated`]) of the core's rows and the enabled plugins' (each widest-of-its-kind: fs's at
-/// `fs`, net's if `net`), the floor `n`.
+/// The whole filter's verdict on `d`: the core's rows, then the enabled plugins' (fs's at
+/// `fs`, net's if `net`), behind the arch and gate checks, the floor `n`. [`TREE`] is this
+/// function's tree (the combinator's), checked equal to it by the `tree_is_policy` harnesses
+/// below; [`filter`] compiles it.
 pub fn policy(mode: Mode, n: u64, gate: u64, fs: Fs, net: bool) -> impl Fn(&seccomp_data) -> u32 {
     let (threads, fork) = (mode != Mode::Coroutine, mode == Mode::Fork);
     let n = n as u32;
@@ -87,27 +88,50 @@ pub fn policy(mode: Mode, n: u64, gate: u64, fs: Fs, net: bool) -> impl Fn(&secc
         if d.instruction_pointer != gate {
             return SECCOMP_RET_TRAP;
         }
-        let files = fs != Fs::Off && fs::files(d, n, fs == Fs::ReadWrite);
-        if core(d, threads, fork) || files || (net && net::sockets(d, n)) { SECCOMP_RET_ALLOW } else { SECCOMP_RET_KILL_PROCESS }
+        if core(d, threads, fork) || fs::enabled(d, n, fs) || net::enabled(d, n, net) { SECCOMP_RET_ALLOW } else { SECCOMP_RET_KILL_PROCESS }
     }
 }
 
-/// The program of the core's rows and `subs` (each a plugin's, [`crate::Plugin::rows`]), behind
-/// the arch and gate checks.
-pub(crate) fn program(mode: Mode, gate: u64, subs: Vec<Cond>) -> Vec<sock_filter> {
-    let (threads, fork) = (mode != Mode::Coroutine, mode == Mode::Fork);
-    seccomp_fn_verify::compile(&gated(AUDIT_ARCH_X86_64, gate, seccomp_fn::rows!(core(d, threads, fork)), subs))
-}
+/// The filter's tree, as `const` data: seccomp-fn-verify's combinator (`gated!`) of the core's
+/// rows and each plugin's sub-filter ([`fs::ROWS`], [`net::ROWS`]), over [`filter`]'s params
+/// by position (`mode, n, gate, fs, net`: each `rows!`'s `in (…)`). Each sub-filter can only allow, never change the checks before it; a plugin not
+/// enabled (`fs` off, `net` false) prunes to nothing at build.
+pub const TREE: Tree = seccomp_fn_verify::gated!(
+    arch = S::Const(AUDIT_ARCH_X86_64 as u64),
+    gate = S::Param(2),
+    core = seccomp_fn::rows!(core(d, mode != Mode::Coroutine, mode == Mode::Fork) in (mode, n, gate, fs, net)),
+    subs = [fs::ROWS, net::ROWS],
+);
+seccomp_fn_verify::filter!(
+    /// [`TREE`]'s program for the params: [`policy`]'s (the harnesses below), compiled by
+    /// seccomp-fn-verify's compiler, proven once for every tree.
+    pub fn filter(mode: Mode, n: u64, gate: u64, fs: Fs, net: bool) = TREE, policy;
+    check tree_is_policy
+);
 
-/// [`policy`]'s program.
-pub fn filter(mode: Mode, n: u64, gate: u64, fs: Fs, net: bool) -> Vec<sock_filter> {
-    let n = n as u32;
-    let mut subs = vec![];
-    if fs != Fs::Off {
-        subs.push(fs::rows(n, fs == Fs::ReadWrite));
-    }
-    if net {
-        subs.push(net::rows(n));
-    }
-    program(mode, gate, subs)
+// The check, per mode and plugin choice; the floor and gate symbolic; every call.
+#[cfg(kani)]
+mod proof {
+    use super::*;
+    use ::kani::any;
+    seccomp_fn_verify::harnesses!(tree_is_policy, unwind = 64;
+        coroutine_off => (None, Mode::Coroutine, any(), any(), Fs::Off, false);
+        coroutine_off_net => (None, Mode::Coroutine, any(), any(), Fs::Off, true);
+        coroutine_ro => (None, Mode::Coroutine, any(), any(), Fs::ReadOnly, false);
+        coroutine_ro_net => (None, Mode::Coroutine, any(), any(), Fs::ReadOnly, true);
+        coroutine_rw => (None, Mode::Coroutine, any(), any(), Fs::ReadWrite, false);
+        coroutine_rw_net => (None, Mode::Coroutine, any(), any(), Fs::ReadWrite, true);
+        threaded_off => (None, Mode::Threaded, any(), any(), Fs::Off, false);
+        threaded_off_net => (None, Mode::Threaded, any(), any(), Fs::Off, true);
+        threaded_ro => (None, Mode::Threaded, any(), any(), Fs::ReadOnly, false);
+        threaded_ro_net => (None, Mode::Threaded, any(), any(), Fs::ReadOnly, true);
+        threaded_rw => (None, Mode::Threaded, any(), any(), Fs::ReadWrite, false);
+        threaded_rw_net => (None, Mode::Threaded, any(), any(), Fs::ReadWrite, true);
+        fork_off => (None, Mode::Fork, any(), any(), Fs::Off, false);
+        fork_off_net => (None, Mode::Fork, any(), any(), Fs::Off, true);
+        fork_ro => (None, Mode::Fork, any(), any(), Fs::ReadOnly, false);
+        fork_ro_net => (None, Mode::Fork, any(), any(), Fs::ReadOnly, true);
+        fork_rw => (None, Mode::Fork, any(), any(), Fs::ReadWrite, false);
+        fork_rw_net => (None, Mode::Fork, any(), any(), Fs::ReadWrite, true);
+    );
 }

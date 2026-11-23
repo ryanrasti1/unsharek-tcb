@@ -1,6 +1,7 @@
 //! The filter's policy as it was before the typed view (unsharek-tcb's tcb-rework, da22c82):
 //! kept to check the new one's verdicts against (tests/filter.rs, `same_as_before`). Verbatim
-//! but for paths.
+//! but for paths, and openat's flags cut to the four the runtime uses (`O_RDONLY`; read-write
+//! `O_RDWR`, with `O_CREAT`, `O_EXCL`).
 #![allow(non_upper_case_globals, dead_code, clippy::all)]
 
 use libc::*;
@@ -118,26 +119,11 @@ pub fn policy(n: u64, writes: bool) -> impl Fn(&seccomp_data) -> u32 {
                 if d.args[0] >= n
                     && d.args[0] <= INT_MAX
                     && d.args[3] <= MODE_MAX
+                    // (the one change since: openat's flags cut to the runtime's four)
                     && (d.args[2] == O_RDONLY | O_NB
-                        || d.args[2] == O_RDONLY | O_NOFOLLOW | O_NB
-                        || d.args[2] == O_RDONLY | O_DIRECTORY | O_NB
-                        || d.args[2] == O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NB
                         || (writes
-                            && (d.args[2] == O_RDONLY | O_CREAT | O_NB
-                                || d.args[2] == O_RDONLY | O_CREAT | O_EXCL | O_NB
-                                || d.args[2] == O_WRONLY | O_NB
-                                || d.args[2] == O_WRONLY | O_TRUNC | O_NB
-                                || d.args[2] == O_WRONLY | O_APPEND | O_NB
-                                || d.args[2] == O_WRONLY | O_CREAT | O_NB
-                                || d.args[2] == O_WRONLY | O_CREAT | O_TRUNC | O_NB
-                                || d.args[2] == O_WRONLY | O_CREAT | O_APPEND | O_NB
-                                || d.args[2] == O_WRONLY | O_CREAT | O_EXCL | O_NB
-                                || d.args[2] == O_RDWR | O_NB
-                                || d.args[2] == O_RDWR | O_TRUNC | O_NB
-                                || d.args[2] == O_RDWR | O_APPEND | O_NB
+                            && (d.args[2] == O_RDWR | O_NB
                                 || d.args[2] == O_RDWR | O_CREAT | O_NB
-                                || d.args[2] == O_RDWR | O_CREAT | O_TRUNC | O_NB
-                                || d.args[2] == O_RDWR | O_CREAT | O_APPEND | O_NB
                                 || d.args[2] == O_RDWR | O_CREAT | O_EXCL | O_NB))) =>
             {
                 SECCOMP_RET_ALLOW

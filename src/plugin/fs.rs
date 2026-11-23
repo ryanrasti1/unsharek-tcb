@@ -10,22 +10,17 @@ use std::path::PathBuf;
 
 use libc::seccomp_data;
 use seccomp_fn_verify::calls::{Call, CallExt};
-use seccomp_fn_verify::expr::Cond;
+use seccomp_fn_verify::tree::C;
 use rustix::fs::{Mode as FsMode, OFlags};
 
-use super::Plugin;
+use super::{Plugin, Rows};
 use crate::{Error, Result};
 
 // Flags the rows compare with, libc's, as the typed view's fields have them (`flags`: an `int`).
 const O_RDONLY: i32 = libc::O_RDONLY;
-const O_WRONLY: i32 = libc::O_WRONLY;
 const O_RDWR: i32 = libc::O_RDWR;
 const O_CREAT: i32 = libc::O_CREAT;
 const O_EXCL: i32 = libc::O_EXCL;
-const O_TRUNC: i32 = libc::O_TRUNC;
-const O_APPEND: i32 = libc::O_APPEND;
-const O_DIRECTORY: i32 = libc::O_DIRECTORY;
-const O_NOFOLLOW: i32 = libc::O_NOFOLLOW;
 /// Every `openat`'s: nonblocking (a FIFO or a device must not block the open), close-on-exec.
 const O_NB: i32 = libc::O_NONBLOCK | libc::O_CLOEXEC;
 const AT_SYMLINK_NOFOLLOW: i32 = libc::AT_SYMLINK_NOFOLLOW;
@@ -114,11 +109,8 @@ impl Plugin for Files {
         Ok(())
     }
 
-    fn rows(&self, n: u32) -> Option<Cond> {
-        match self.access() {
-            Fs::Off => None,
-            a => Some(rows(n, a == Fs::ReadWrite)),
-        }
+    fn rows(&self) -> Rows {
+        Rows { fs: self.access(), net: false }
     }
 }
 
@@ -132,39 +124,21 @@ pub(crate) fn files(d: &seccomp_data, n: u32, writes: bool) -> bool {
         // The close of an fd this plugin opened, never a kept one (the guest answers that).
         Call::Close { fd } => opened(fd),
         // A file by its path (absolute, or relative to a directory the plugin opened), within
-        // the roots (Landlock). Always `O_NONBLOCK` and `O_CLOEXEC`: an open never waits (a
-        // FIFO's, a device's); the runtime clears `O_NONBLOCK` after its `fstat` finds a regular
-        // file or a directory (the runtime's, not a guarantee: it avoids a hang). A path's
-        // metadata is this open, then `fstat` (no `statx`, `newfstatat`, `fstatfs`: the guest
-        // fakes statfs). Read-only: `O_RDONLY`, with any of `O_DIRECTORY`, `O_NOFOLLOW`.
-        // Read-write also: `O_WRONLY` or `O_RDWR` with `O_TRUNC` or `O_APPEND`, and `O_CREAT`
-        // (`O_EXCL` with it) for each access mode, the mode without `S_ISUID` or `S_ISGID` (the
-        // kernel ignores it without `O_CREAT`: pinned anyway). Never `O_PATH`, `O_TMPFILE`,
-        // `O_DIRECT`.
+        // the roots (Landlock). Exactly the opens the runtime makes, each `O_NONBLOCK` and
+        // `O_CLOEXEC` (an open never waits: a FIFO's, a device's; the runtime clears
+        // `O_NONBLOCK` after its `fstat` finds a regular file or a directory, the runtime's, not
+        // a guarantee: it avoids a hang). Read-only: `O_RDONLY`. Read-write also: `O_RDWR`, and
+        // `O_RDWR | O_CREAT` (`O_EXCL` with it), the mode without `S_ISUID` or `S_ISGID` (the
+        // kernel ignores it without `O_CREAT`: pinned anyway). A truncation is `ftruncate`, an
+        // append the guest's offset, a write-only open a read-write one; never `O_WRONLY`,
+        // `O_TRUNC`, `O_APPEND`, `O_DIRECTORY`, `O_NOFOLLOW`, `O_PATH`, `O_TMPFILE`, `O_DIRECT`. A
+        // path's metadata is this open, then `fstat` (no `statx`, `newfstatat`, `fstatfs`: the
+        // guest fakes statfs).
         Call::Openat { dfd, flags, mode, .. } => {
             opened_dir(dfd)
                 && mode <= MODE_MAX
                 && (flags == O_RDONLY | O_NB
-                    || flags == O_RDONLY | O_NOFOLLOW | O_NB
-                    || flags == O_RDONLY | O_DIRECTORY | O_NB
-                    || flags == O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NB
-                    || writes
-                        && (flags == O_RDONLY | O_CREAT | O_NB
-                            || flags == O_RDONLY | O_CREAT | O_EXCL | O_NB
-                            || flags == O_WRONLY | O_NB
-                            || flags == O_WRONLY | O_TRUNC | O_NB
-                            || flags == O_WRONLY | O_APPEND | O_NB
-                            || flags == O_WRONLY | O_CREAT | O_NB
-                            || flags == O_WRONLY | O_CREAT | O_TRUNC | O_NB
-                            || flags == O_WRONLY | O_CREAT | O_APPEND | O_NB
-                            || flags == O_WRONLY | O_CREAT | O_EXCL | O_NB
-                            || flags == O_RDWR | O_NB
-                            || flags == O_RDWR | O_TRUNC | O_NB
-                            || flags == O_RDWR | O_APPEND | O_NB
-                            || flags == O_RDWR | O_CREAT | O_NB
-                            || flags == O_RDWR | O_CREAT | O_TRUNC | O_NB
-                            || flags == O_RDWR | O_CREAT | O_APPEND | O_NB
-                            || flags == O_RDWR | O_CREAT | O_EXCL | O_NB))
+                    || writes && (flags == O_RDWR | O_NB || flags == O_RDWR | O_CREAT | O_NB || flags == O_RDWR | O_CREAT | O_EXCL | O_NB))
         }
         // An opened file's metadata, entries and bytes at an offset (no `lseek`: files are read
         // and written only with `pread64`/`pwrite64`, at offsets the guest kernel keeps, so the
@@ -193,10 +167,14 @@ pub(crate) fn files(d: &seccomp_data, n: u32, writes: bool) -> bool {
     }
 }
 
-/// [`files`]'s rows, as the combinator's sub-filter (`crate::filter`).
-pub(crate) fn rows(n: u32, writes: bool) -> Cond {
-    seccomp_fn::rows!(files(d, n, writes))
+/// The plugin's rows when `fs` enables them (read-write ones at `Fs::ReadWrite`).
+pub(crate) fn enabled(d: &seccomp_data, n: u32, fs: Fs) -> bool {
+    fs != Fs::Off && files(d, n, fs == Fs::ReadWrite)
 }
+
+/// [`enabled`]'s rows, as the combinator's sub-filter (`crate::filter::TREE`), over the filter's
+/// params (`crate::filter::filter`'s, by position).
+pub(crate) const ROWS: C = seccomp_fn::rows!(enabled(d, n as u32, fs) in (mode, n, gate, fs, net));
 
 // Landlock's (include/uapi/linux/landlock.h; not in libc): the calls, and the fs rights.
 const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;

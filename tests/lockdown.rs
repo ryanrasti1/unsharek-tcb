@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 use unsharek_tcb::plugin::{Files, Net};
 use unsharek_tcb::plugin::Fs;
-use unsharek_tcb::{Config, Error, Kind, Mode};
+use unsharek_tcb::{Config, Error, Expect, Mode};
 
 // ------------------------------------------------------------------------------------------------
 // A gate, and a SIGSYS handler that returns through it.
@@ -114,8 +114,7 @@ fn with_plugins(guest: &Guest, grants: impl FnOnce(&mut Vec<RawFd>), plugins: &[
     let fds = arrange(&own.iter().chain(&granted).copied().collect::<Vec<_>>());
     let mut c = Config::new(gate_ip()).mode(guest.mode).grant(granted.iter().map(|&fd| fds.get(fd).unwrap()));
     for &fd in &own {
-        let kind = if link(fd) == "anon_inode:[pidfd]" { Kind::Pidfd } else { Kind::Eventfd };
-        c = c.grant_as(kind, [fds.get(fd).unwrap()]);
+        c = c.grant_as(Expect::Is(link(fd)), [fds.get(fd).unwrap()]);
     }
     unsharek_tcb::lockdown(c, plugins).map(|()| fds)
 }
@@ -441,15 +440,15 @@ fn shared_anonymous_memory_in_fork_mode_only() {
     }
 }
 
-/// A fd declared an eventfd (a CPU token) that isn't one (a file, a pipe posing as one, which
-/// would get read and write as the guest's own): refused. An eventfd and a pidfd pass.
+/// Paranoia: a fd declared an eventfd (a CPU token) that isn't one (a file, a pipe posing as one,
+/// which would get read and write as the guest's own): refused. An eventfd and a pidfd pass.
 #[test]
-fn refuses_a_guest_fd_of_the_wrong_kind() {
-    let declared = |mode: Mode, kind: Kind, make: fn() -> RawFd| {
+fn paranoia_refuses_a_guest_fd_of_the_wrong_kind() {
+    let declared = |mode: Mode, kind: Expect, make: fn() -> RawFd| {
         exit_code(in_child(move || {
             let fd = make();
             let f = arrange(&[fd]);
-            verdict(unsharek_tcb::lockdown(Config::new(gate_ip()).mode(mode).grant_as(kind, [f.get(fd).unwrap()]), &[]).map(|()| f))
+            verdict(unsharek_tcb::lockdown(Config::new(gate_ip()).mode(mode).grant_as(kind.clone(), [f.get(fd).unwrap()]), &[]).map(|()| f))
         }))
     };
     let file = || {
@@ -464,15 +463,17 @@ fn refuses_a_guest_fd_of_the_wrong_kind() {
         assert_eq!(unsafe { libc::pipe(p.as_mut_ptr()) }, 0);
         p[1]
     };
-    assert_eq!(declared(Mode::Threaded, Kind::Eventfd, file), 2, "a file");
-    assert_eq!(declared(Mode::Threaded, Kind::Eventfd, pipe), 2, "a pipe");
-    assert_eq!(declared(Mode::Threaded, Kind::Eventfd, eventfd), 0, "an eventfd");
-    assert_eq!(declared(Mode::Fork, Kind::Pidfd, pidfd), 0, "a pidfd");
+    let ev = || Expect::is("anon_inode:[eventfd]");
+    assert_eq!(declared(Mode::Threaded, ev(), file), 2, "a file");
+    assert_eq!(declared(Mode::Threaded, ev(), pipe), 2, "a pipe");
+    assert_eq!(declared(Mode::Threaded, ev(), eventfd), 0, "an eventfd");
+    assert_eq!(declared(Mode::Fork, Expect::is("anon_inode:[pidfd]"), pidfd), 0, "a pidfd");
+    assert_eq!(declared(Mode::Threaded, Expect::is("pipe:"), pipe), 0, "a pipe declared one");
 }
 
-/// A second thread: refused, its tid named. Lockdown is then no further than step 1.
+/// Paranoia: a second thread, refused, its tid named, before anything is closed.
 #[test]
-fn refuses_a_second_thread() {
+fn paranoia_refuses_a_second_thread() {
     let got = exit_code(in_child(|| {
         std::thread::spawn(|| {
             loop {
@@ -688,9 +689,9 @@ fn check_times() {
             let Ok(f) = lockdown(&Guest { fds: tokens, mode }, |s| s.extend([0, 1, 2])) else {
                 return 1;
             };
-            let (checks, fds, paranoia) = unsharek_tcb::times_ns();
+            let (fds, paranoia) = unsharek_tcb::times_ns();
             use std::fmt::Write;
-            let _ = writeln!(m, "{mode:?}, {} fds: paranoia {} us, threads and fds {} us ({} ns a fd), checks {} us", f.n, paranoia / 1000, fds / 1000, fds / f.n as u64, checks / 1000);
+            let _ = writeln!(m, "{mode:?}, {} fds: kept fds open {} us ({} ns a fd), paranoia {} us", f.n, fds / 1000, fds / f.n as u64, paranoia / 1000);
             g(libc::SYS_write, [f.get(2).unwrap() as usize, m.as_ptr() as usize, m.len()]);
             0
         }));
@@ -731,12 +732,12 @@ fn fs_roots_are_confined() {
             }
             if access == Fs::ReadWrite {
                 // SAFETY: openat from the gate, with a mode.
-                let w = unsafe { gate(libc::SYS_openat as usize, n, new.as_ptr() as usize, nb | (libc::O_CREAT | libc::O_WRONLY) as usize, 0o644, 0, 0) };
+                let w = unsafe { gate(libc::SYS_openat as usize, n, new.as_ptr() as usize, nb | (libc::O_CREAT | libc::O_RDWR) as usize, 0o644, 0, 0) };
                 if w < n as isize || g(libc::SYS_write, [w as usize, b.as_ptr() as usize, 2]) != 2 {
                     return 4;
                 }
                 // SAFETY: as above.
-                let o = unsafe { gate(libc::SYS_openat as usize, n, outside.as_ptr() as usize, nb | libc::O_WRONLY as usize, 0, 0, 0) };
+                let o = unsafe { gate(libc::SYS_openat as usize, n, outside.as_ptr() as usize, nb | libc::O_RDWR as usize, 0, 0, 0) };
                 if o != -(libc::EACCES as isize) {
                     return 5;
                 }
@@ -759,7 +760,7 @@ fn fs_read_only_refuses_a_write_open() {
         let Ok(f) = with_plugins(&Guest { fds: vec![], mode: Mode::Coroutine }, |_| (), &[&Files::new().root("/", Fs::ReadOnly)]) else {
             return 1;
         };
-        g(libc::SYS_openat, [f.n as usize, c"/tmp/x".as_ptr() as usize, (libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) as usize]);
+        g(libc::SYS_openat, [f.n as usize, c"/tmp/x".as_ptr() as usize, (libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC) as usize]);
         2
     });
     assert!(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS, "status {status:#x}");
@@ -842,27 +843,65 @@ fn paranoia_refuses_inherited_shared_memory() {
     assert_eq!(code, 0);
 }
 
-/// The mode's own kinds: an eventfd only in threaded and fork mode, a pidfd only in fork mode
-/// (declared so: a kind rule, not a count); a fd declared one that isn't is refused too.
+/// Lockdown takes the caller's declarations as given: no mode rule (a CPU token's eventfd in
+/// coroutine mode is kept); what a fd is, is paranoia's to look at.
 #[test]
-fn kinds_are_the_modes() {
-    let run = |mode: Mode, kind: Kind, make: fn() -> RawFd| {
-        exit_code(in_child(move || {
-            let fd = make();
-            let f = arrange(&[0, 1, 2, fd]);
-            match unsharek_tcb::lockdown(Config::new(gate_ip()).mode(mode).grant([0, 1, 2]).grant_as(kind, [f.get(fd).unwrap()]), &[]) {
-                Ok(_) => 0,
-                Err(Error::ModeKind { .. }) => 1,
-                Err(Error::FdKind { .. }) => 2,
-                Err(_) => 3,
-            }
-        }))
-    };
-    assert_eq!(run(Mode::Coroutine, Kind::Eventfd, eventfd), 1, "coroutine: an eventfd");
-    assert_eq!(run(Mode::Coroutine, Kind::Pidfd, pidfd), 1, "coroutine: a pidfd");
-    assert_eq!(run(Mode::Threaded, Kind::Pidfd, pidfd), 1, "threaded: a pidfd");
-    assert_eq!(run(Mode::Threaded, Kind::Eventfd, eventfd), 0, "threaded: an eventfd");
-    assert_eq!(run(Mode::Fork, Kind::Pidfd, pidfd), 0, "fork: a pidfd");
-    assert_eq!(run(Mode::Threaded, Kind::Eventfd, pidfd), 2, "threaded: a pidfd declared an eventfd");
-    assert_eq!(run(Mode::Fork, Kind::Pidfd, eventfd), 2, "fork: an eventfd declared a pidfd");
+fn declarations_are_the_callers() {
+    let code = exit_code(in_child(|| {
+        let fd = eventfd();
+        let f = arrange(&[0, 1, 2, fd]);
+        let c = Config::new(gate_ip()).grant([0, 1, 2]).grant_as(Expect::is("anon_inode:[eventfd]"), [f.get(fd).unwrap()]);
+        match unsharek_tcb::lockdown(c, &[]) {
+            Ok(()) => 0,
+            Err(_) => 1,
+        }
+    }));
+    assert_eq!(code, 0);
+}
+
+/// With paranoia off, lockdown still enforces its exact steps: a gap and a closed grant are
+/// refused, and an fd at or above `n` is closed (the gate's ppoll sees it gone), while what is
+/// paranoia's (a second thread, a fd not what it was declared) goes unchecked.
+#[test]
+fn without_paranoia_the_exact_steps_hold() {
+    let gap = exit_code(in_child(|| {
+        let mut p = [0; 2];
+        // SAFETY: a pipe, its write end moved to 4, 3 closed.
+        unsafe {
+            assert_eq!(libc::pipe(p.as_mut_ptr()), 0);
+            assert_eq!(libc::dup2(p[1], 4), 4);
+            libc::close(3);
+        }
+        match unsharek_tcb::lockdown(Config::new(gate_ip()).paranoia(false).grant([0, 1, 2, 4]), &[]) {
+            Err(Error::Gap { gap: 3, n: 4 }) => 0,
+            _ => 1,
+        }
+    }));
+    assert_eq!(gap, 0, "a gap");
+    let closed = exit_code(in_child(|| {
+        // SAFETY: closes fd 3, this process's.
+        unsafe { libc::close(3) };
+        match unsharek_tcb::lockdown(Config::new(gate_ip()).paranoia(false).grant([0, 1, 2, 3]), &[]) {
+            Err(Error::NotOpen(3)) => 0,
+            _ => 1,
+        }
+    }));
+    assert_eq!(closed, 0, "a closed grant");
+    let stray = exit_code(in_child(|| {
+        let mut p = [0; 2];
+        // SAFETY: a pipe (its ends at 3 and 4, at or above n = 3).
+        assert_eq!(unsafe { libc::pipe(p.as_mut_ptr()) }, 0);
+        // a thread, and a fd declared what it isn't: paranoia's, not checked
+        std::thread::spawn(|| loop {
+            std::thread::park();
+        });
+        let c = Config::new(gate_ip()).paranoia(false).grant([0, 1]).grant_as(Expect::is("anon_inode:[eventfd]"), [2]);
+        if unsharek_tcb::lockdown(c, &[]).is_err() {
+            return 1;
+        }
+        let mut pfd = [libc::pollfd { fd: p[0], events: libc::POLLIN, revents: 0 }];
+        let ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        if g(libc::SYS_ppoll, [pfd.as_mut_ptr() as usize, 1, &ts as *const _ as usize]) == 1 && pfd[0].revents == libc::POLLNVAL { 0 } else { 2 }
+    }));
+    assert_eq!(stray, 0, "an fd at or above n closed");
 }

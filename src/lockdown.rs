@@ -1,7 +1,7 @@
-//! Lockdown: the moment the process stops being the host's. [`lockdown`] makes the steps of
-//! `crate::lockdown`'s comment (and README.md's "Design"), in its order, with ordinary syscalls (nothing
-//! traps yet: no filter is in). The first check is the thread count, so nothing can open an fd,
-//! map memory or make a thread behind the later ones.
+//! Lockdown: the moment the process stops being the host's. [`lockdown`] makes the exact steps of
+//! `crate::lockdown`'s comment (and README.md's "Design"), in its order, with ordinary syscalls
+//! (nothing traps yet: no filter is in). What it can only look at, not enforce, is paranoia's
+//! (paranoia.rs), best-effort.
 
 use std::io;
 use std::os::fd::{OwnedFd, RawFd};
@@ -15,7 +15,7 @@ use rustix::process::{DumpableBehavior, Resource, Rlimit};
 use rustix::thread::{CapabilitySet, CapabilitySets};
 
 use crate::plugin::Plugin;
-use crate::{Config, Error, Kind, Mode, Result, filter};
+use crate::{Config, Error, Expect, Result, filter};
 
 pub(crate) fn os(what: &'static str) -> impl FnOnce(io::Error) -> Error {
     move |source| Error::Os { what, source }
@@ -30,112 +30,87 @@ pub(crate) fn rx(what: &'static str) -> impl FnOnce(Errno) -> Error {
     move |e| Error::Os { what, source: e.into() }
 }
 
-/// How long the last lockdown's checks took, in ns: steps 1-3 (threads, fds, mappings), step 2
-/// (threads and fds), and the paranoia check (0: off). For measuring, not a policy.
-static CHECK_NS: AtomicU64 = AtomicU64::new(0);
+/// How long the last lockdown's checks took, in ns: step 1 (each kept fd open), and paranoia's (0:
+/// off). For measuring, not a policy.
 static FD_NS: AtomicU64 = AtomicU64::new(0);
 static PARANOIA_NS: AtomicU64 = AtomicU64::new(0);
 
-/// The last lockdown's times, in ns: (checks, threads and fds, paranoia).
+/// The last lockdown's times, in ns: (kept fds open, paranoia).
 #[cfg(feature = "testing")]
-pub fn times_ns() -> (u64, u64, u64) {
-    (CHECK_NS.load(Ordering::Relaxed), FD_NS.load(Ordering::Relaxed), PARANOIA_NS.load(Ordering::Relaxed))
+pub fn times_ns() -> (u64, u64) {
+    (FD_NS.load(Ordering::Relaxed), PARANOIA_NS.load(Ordering::Relaxed))
 }
 
 pub(crate) fn lockdown(config: Config, plugins: &[&dyn Plugin]) -> Result<()> {
     let mode = config.mode;
-    // The kept fds, each with its declared kind (a plugin's kept as grants are): exactly 0..n,
-    // the caller put them there (no renumbering here). The filter is compiled first (it
-    // allocates, and checks nothing).
-    let mut keep: Vec<(RawFd, Kind)> = config.fds.iter().copied().chain(plugins.iter().flat_map(|p| p.kept().iter().map(|k| (k.0, Kind::Any)))).collect();
+    // The kept fds, each with what the caller declares it (a plugin's kept as grants are).
+    let mut keep: Vec<(RawFd, Expect)> =
+        config.fds.iter().cloned().chain(plugins.iter().flat_map(|p| p.kept().iter().map(|k| (k.0, Expect::Any)))).collect();
     keep.sort_by_key(|k| k.0);
     keep.dedup_by_key(|k| k.0);
     let n = keep.len() as RawFd;
+    // 1. Exactly 0..n (the caller put them there: no renumbering here), each open.
     if let Some(gap) = (0..n).find(|&i| keep[i as usize].0 != i) {
         return Err(Error::Gap { gap, n });
     }
-    // The mode's own, by declared kind: eventfds (the CPU tokens) only in threaded and fork mode;
-    // a pidfd (init's: each forked process polls it to end with init) only in fork mode.
-    for &(fd, kind) in &keep {
-        let ok = match kind {
-            Kind::Any => true,
-            Kind::Eventfd => mode != Mode::Coroutine,
-            Kind::Pidfd => mode == Mode::Fork,
-        };
-        if !ok {
-            return Err(Error::ModeKind { fd, kind, mode });
+    let t = Instant::now();
+    for &(fd, _) in &keep {
+        // SAFETY: fcntl on this process's fd.
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+            return Err(Error::NotOpen(fd));
         }
     }
-    let subs = plugins.iter().filter_map(|p| p.rows(n as u32)).collect();
-    let prog = filter::program(mode, config.gate, subs);
+    FD_NS.store(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    // The filter is compiled first (it allocates, and checks nothing).
+    let rows = plugins.iter().map(|p| p.rows()).fold(crate::plugin::Rows::default(), |a, r| crate::plugin::Rows {
+        fs: a.fs.max(r.fs),
+        net: a.net || r.net,
+    });
+    let prog = filter::filter(mode, n as u64, config.gate, rows.fs, rows.net);
     // What the plugins need of the kernel (the file plugin's Landlock): refused now, before
     // anything changes, if not there.
     for p in plugins {
         p.check()?;
     }
-
-    {
-        // Every read of /proc is through this one fd, checked to be the kernel's procfs (not
-        // whatever is mounted at /proc: a FUSE or tmpfs there could answer anything), and its
-        // process to be this one (step 1 finds this thread's tid in it). Closed by step 4.
-        let proc = proc_self(n)?;
-        // 0. The assumptions, best-effort (paranoia.rs).
-        if config.paranoia {
-            let t = Instant::now();
-            crate::paranoia::check(&proc, mode)?;
-            PARANOIA_NS.store(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        } else {
-            PARANOIA_NS.store(0, Ordering::Relaxed);
-        }
+    // Paranoia, best-effort (paranoia.rs): threads, the kept fds' kinds, the mappings, a tracer,
+    // a process sharing the memory.
+    if config.paranoia {
         let t = Instant::now();
-        // 1. One thread.
-        one_thread(&proc)?;
-        // 2. Each kept fd open (F_GETFD), of its declared kind, and of no kind refused.
-        for &(fd, kind) in &keep {
-            // SAFETY: fcntl on this process's fd.
-            let link = if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 { None } else { fd_kind(&proc, fd).ok() };
-            let Some(link) = link else { return Err(Error::NotOpen(fd)) };
-            let declared = match kind {
-                Kind::Any => true,
-                Kind::Eventfd => link == "anon_inode:[eventfd]",
-                Kind::Pidfd => link == "anon_inode:[pidfd]",
-            };
-            if !declared || refused_kind(&proc, fd, &link) {
-                return Err(Error::FdKind { fd, kind, link });
-            }
-        }
-        FD_NS.store(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        // 3. Every mapping.
-        check_maps(&proc, mode)?;
-        CHECK_NS.store(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        crate::paranoia::check(mode, n, &keep)?;
+        PARANOIA_NS.store(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    } else {
+        PARANOIA_NS.store(0, Ordering::Relaxed);
     }
-    // 4. Every fd at or above `n` closed, /proc's among them (not refused: a CLI inherits stray
-    // fds). After it, no row frees a number below `n` (no close of one, no dup), so by the
-    // kernel's lowest-free rule every fd made later is at or above `n`.
+    // 2. Every fd at or above `n` closed (not refused: a CLI inherits stray fds). After it, no row
+    // frees a number below `n` (no close of one, no dup), so by the kernel's lowest-free rule
+    // every fd made later is at or above `n`.
     // SAFETY: closes this process's fds at or above `n`: none is kept.
     if unsafe { libc::syscall(libc::SYS_close_range, n as u32, u32::MAX, 0) } != 0 {
         return Err(last_os("close_range"));
     }
-    // 5. No core dump, not dumpable.
+    // 3. No core dump, not dumpable.
     rustix::process::setrlimit(Resource::Core, Rlimit { current: Some(0), maximum: Some(0) }).map_err(rx("RLIMIT_CORE"))?;
     rustix::process::set_dumpable_behavior(DumpableBehavior::NotDumpable).map_err(rx("PR_SET_DUMPABLE"))?;
-    // 6. Capabilities: CAP_DAC_OVERRIDE would let the file plugin's openat read root-only files
-    // inside its roots; otherwise defence in depth.
+    // 4. Capabilities dropped (CAP_DAC_OVERRIDE would let the file plugin's openat read root-only
+    // files inside its roots; otherwise defence in depth), then no_new_privs: unprivileged
+    // seccomp needs it, and no exec gains anything after.
     drop_capabilities()?;
-    // 7. no_new_privs: unprivileged seccomp needs it, and no exec gains anything after.
+    if config.paranoia {
+        crate::paranoia::no_capabilities()?;
+    }
     rustix::thread::set_no_new_privs(true).map_err(rx("PR_SET_NO_NEW_PRIVS"))?;
-    // 7b. Each plugin's setup (the file plugin's Landlock ruleset of its roots: it needs
+    // 5. Each plugin's setup (the file plugin's Landlock ruleset of its roots: it needs
     // no_new_privs).
     for p in plugins {
         p.setup()?;
     }
-    // 8. The filter, with TSYNC.
+    // 6. The filter, with TSYNC.
     install(&prog)?;
     Ok(())
 }
 
 /// `/proc/self`, opened once: a directory on procfs (`PROC_SUPER_MAGIC`).
-fn proc_self(n: RawFd) -> Result<OwnedFd> {
+pub(crate) fn proc_self(n: RawFd) -> Result<OwnedFd> {
     const PROC_SUPER_MAGIC: i64 = 0x9fa0;
     let open = rustix::fs::open("/proc/self", OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, FsMode::empty())
         .map_err(rx("/proc/self"))?;
@@ -169,131 +144,27 @@ pub(crate) fn numbers_at(dir: &OwnedFd, name: &str) -> io::Result<Vec<i32>> {
     Ok(out)
 }
 
-/// Step 1. A thread just joined (unsharek's image builders) is still listed while it finishes
-/// exiting: a few milliseconds' grace, then the others are named. This thread must be listed:
-/// else `/proc` is another pid namespace's, and its `self` isn't this process.
-fn one_thread(proc: &OwnedFd) -> Result<()> {
-    let me = rustix::thread::gettid().as_raw_nonzero().get();
-    let mut others = vec![];
-    for _ in 0..20 {
-        let tids = numbers_at(proc, "task").map_err(os("/proc/self/task"))?;
-        if !tids.contains(&me) {
-            return Err(Error::Os { what: "/proc/self/task", source: io::Error::other(format!("tid {me} not listed: another pid namespace's /proc")) });
-        }
-        others = tids.into_iter().filter(|&tid| tid != me).collect();
-        if others.is_empty() {
-            return Ok(());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-    others.sort_unstable();
-    Err(Error::Threads(others))
-}
-
-/// `/proc/self/fd/<fd>`'s link: what the fd is (`anon_inode:[eventfd]`, `socket:[123]`, a path).
-pub(crate) fn fd_kind(proc: &OwnedFd, fd: RawFd) -> io::Result<String> {
-    let link = rustix::fs::readlinkat(proc, format!("fd/{fd}"), Vec::new())?;
-    Ok(link.to_string_lossy().into_owned())
-}
-
-/// Step 2: kinds no caller means to give, refused on every kept fd: read and write on one would
-/// reach past the sandbox (another process's memory, the kernel's state) or act asynchronously
-/// (io_uring). `kind` is its `/proc/self/fd` link.
-fn refused_kind(proc: &OwnedFd, fd: RawFd, kind: &str) -> bool {
-    const REFUSED: [&str; 9] = [
-        "anon_inode:[io_uring]",
-        "anon_inode:[userfaultfd]",
-        "anon_inode:[perf_event]",
-        "anon_inode:[fanotify]",
-        "anon_inode:seccomp notify",
-        "anon_inode:bpf-",
-        "/dev/mem",
-        "/dev/kmem",
-        "/dev/port",
-    ];
-    let proc_mem = kind.starts_with("/proc/") && kind.ends_with("/mem");
-    // A writable fd of /proc or /sys: the kernel's state (a sysctl, another process's).
-    let kernel_state = (kind.starts_with("/proc/") || kind.starts_with("/sys/"))
-        && read_at(proc, &format!("fdinfo/{fd}"))
-            .ok()
-            .and_then(|i| i.lines().find_map(|l| l.strip_prefix("flags:").map(|f| u32::from_str_radix(f.trim(), 8).unwrap_or(0))))
-            .is_none_or(|f| f & libc::O_ACCMODE as u32 != libc::O_RDONLY as u32);
-    REFUSED.iter().any(|r| kind.starts_with(r)) || proc_mem || kernel_state
-}
-
-/// Step 3: every line of `/proc/self/maps` is one of
-/// - private (`p`): the process's own copy, whatever it was mapped from (a file's bytes are
-///   disclosed, never written back);
-/// - shared and not writable: the file's bytes, read (and `mprotect`, which could make it
-///   writable, is no call the filter allows);
-/// - fork mode only: shared anonymous memory (`/dev/zero (deleted)`, the kernel's shmem, device
-///   0:x), which the guest's processes share among themselves.
-///
-/// Anything else is refused: above all a writable shared mapping of a host file (or of a memfd,
-/// `/memfd:…`, or SysV shm, or a device), through which the program could write what the host
-/// reads.
-fn check_maps(proc: &OwnedFd, mode: Mode) -> Result<()> {
-    let maps = read_at(proc, "maps").map_err(os("/proc/self/maps"))?;
-    let shm = shm_dev()?;
-    for line in maps.lines() {
-        if !map_ok(line, mode, &shm) {
-            return Err(Error::Mapping(line.to_owned()));
-        }
-    }
-    Ok(())
-}
-
-/// The kernel's shmem device, as /proc/self/maps writes it (`00:01`): a memfd's, which is on the
-/// same internal mount as `MAP_SHARED | MAP_ANONYMOUS` memory. A tmpfs file named `/dev/zero`,
-/// deleted, has the same path and a `00:` device too, but not this one.
-fn shm_dev() -> Result<String> {
-    let fd = rustix::fs::memfd_create("unsharek-tcb", rustix::fs::MemfdFlags::CLOEXEC).map_err(rx("memfd_create"))?;
-    let st = rustix::fs::fstat(&fd).map_err(rx("memfd fstat"))?;
-    Ok(format!("{:02x}:{:02x}", rustix::fs::major(st.st_dev), rustix::fs::minor(st.st_dev)))
-}
-
-/// One `/proc/self/maps` line (`lo-hi perms offset dev inode [path]`), judged as [`check_maps`]
-/// says; `shm` the shmem device ([`shm_dev`]).
-pub(crate) fn map_ok(line: &str, mode: Mode, shm: &str) -> bool {
-    let mut f = line.splitn(6, ' ');
-    let (Some(_range), Some(perms), Some(_off), Some(dev), Some(_inode)) = (f.next(), f.next(), f.next(), f.next(), f.next())
-    else {
-        return false;
-    };
-    let path = f.next().unwrap_or("").trim_start();
-    let p = perms.as_bytes();
-    if p.len() != 4 {
-        return false;
-    }
-    match (p[1], p[3]) {
-        (_, b'p') => true,
-        (b'-', b's') => true,
-        (b'w', b's') => mode == Mode::Fork && path == "/dev/zero (deleted)" && dev == shm,
-        _ => false,
-    }
-}
-
 /// The process's capability sets (`capget`).
-fn capget() -> Result<CapabilitySets> {
+pub(crate) fn capget() -> Result<CapabilitySets> {
     rustix::thread::capabilities(None).map_err(rx("capget"))
 }
 
 /// Capability number `n`, as rustix takes one.
-fn cap(n: u32) -> CapabilitySet {
+pub(crate) fn cap(n: u32) -> CapabilitySet {
     CapabilitySet::from_bits_retain(1 << n)
 }
 
 /// Any capability in any of the three sets.
-fn any(d: &CapabilitySets) -> bool {
+pub(crate) fn any(d: &CapabilitySets) -> bool {
     !(d.effective | d.permitted | d.inheritable).is_empty()
 }
 
-/// Step 6. The bounding set is dropped where the process may (it holds `CAP_SETPCAP`); an
+/// Step 4. The bounding set is dropped where the process may (it holds `CAP_SETPCAP`); an
 /// unprivileged process can't, and needn't: with nothing permitted, `no_new_privs` and no exec
 /// through the filter, the bounding set bounds nothing it could gain. Then ambient, effective,
-/// permitted and inheritable cleared, and checked empty: lockdown fails if any isn't.
+/// permitted and inheritable cleared (paranoia checks them empty after).
 fn drop_capabilities() -> Result<()> {
-    use rustix::thread::{capability_is_in_ambient_set, capability_is_in_bounding_set};
+    use rustix::thread::capability_is_in_bounding_set;
     let d = capget()?;
     if d.effective.contains(CapabilitySet::SETPCAP) {
         for n in 0..64 {
@@ -313,16 +184,6 @@ fn drop_capabilities() -> Result<()> {
         // Lowering every set is always permitted.
         let none = CapabilitySets { effective: CapabilitySet::empty(), permitted: CapabilitySet::empty(), inheritable: CapabilitySet::empty() };
         rustix::thread::set_capabilities(None, none).map_err(rx("capset"))?;
-    }
-    if any(&capget()?) {
-        return Err(Error::Capabilities("some remain after capset".into()));
-    }
-    for n in 0..64 {
-        // Reads the ambient set; EINVAL past the last capability.
-        let Ok(set) = capability_is_in_ambient_set(cap(n)) else { break };
-        if set {
-            return Err(Error::Capabilities(format!("ambient capability {n} remains")));
-        }
     }
     Ok(())
 }

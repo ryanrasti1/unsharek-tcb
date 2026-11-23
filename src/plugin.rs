@@ -12,13 +12,15 @@
 //! filter.rs) imports neither. Every fd a plugin's calls make is at or above the floor `n`
 //! (lockdown leaves only the kept fds below it), and each of its fd rows says `fd >= n`.
 //!
-//! **Composition.** A plugin's rows are a condition of the tree (seccomp-fn's `rows!` of a
-//! function of its file), which seccomp-fn-verify's combinator (`expr::gated`) puts after the
-//! core's, behind the arch and gate checks: a sub-filter can only allow, never change the checks
-//! before it. The compiler is proven once for every tree, the combinator's among them.
+//! **Composition.** A plugin's rows are a condition of the filter's tree (seccomp-fn's `rows!`
+//! of a function of its file, `ROWS`), which seccomp-fn-verify's combinator (`gated!`, in
+//! filter.rs) puts after the core's, behind the arch and gate checks: a sub-filter can only
+//! allow, never change the checks before it. A plugin chooses only whether its rows are on
+//! ([`Plugin::rows`]: the filter's `fs` and `net` params); the rows themselves are this crate's.
+//! The compiler is proven once for every tree, and the tree is proven equal to the filter's
+//! policy (filter.rs's `tree_is_policy` harnesses).
 
 use crate::Result;
-use seccomp_fn_verify::expr::Cond;
 
 pub(crate) mod fs;
 pub(crate) mod net;
@@ -47,6 +49,14 @@ pub trait Plugin {
     fn kept(&self) -> &[KeptFd] {
         &[]
     }
-    /// Its rows, for the floor `n`: allowed after the core's rows found none, or none.
-    fn rows(&self, n: u32) -> Option<Cond>;
+    /// Which of the filter's plugin rows it turns on (allowed after the core's rows found none).
+    fn rows(&self) -> Rows;
+}
+
+/// The plugin rows a filter has: the file plugin's at `fs` (none when off), the network
+/// plugin's if `net`. Several plugins' combine: the widest `fs`, any `net`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Rows {
+    pub fs: Fs,
+    pub net: bool,
 }

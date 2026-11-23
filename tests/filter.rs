@@ -226,13 +226,14 @@ fn nr(name: &str) -> u32 {
     }) as u32
 }
 
-/// README.md's allowlist tables are the policy's: for each mode and plugin choice, the rows
+/// README.md's and src/plugin/README.md's allowlist tables are the policy's: for each mode and plugin choice, the rows
 /// whose last cell names it (`all`, a mode; a plugin's `fs`, `fs-rw`, `net`) are the
 /// program's rows, in order; without plugins the syscalls they name are exactly the ones
 /// [`ruled`] finds allowed; the `ppoll` row's bound is [`PPOLL_FDS`].
 #[test]
 fn readme_table_is_the_policy() {
-    let readme = include_str!("../README.md");
+    // The core's table, then the plugins' (src/plugin/README.md), in the program's order.
+    let readme = [include_str!("../README.md"), include_str!("../src/plugin/README.md")].concat();
     let lines: Vec<&str> = readme.lines().filter(|l| l.starts_with("| `")).collect();
     for mode in MODES {
         let name = match mode {
@@ -271,7 +272,7 @@ fn readme_table_is_the_policy() {
             }
         }
     }
-    assert_eq!(lines.len(), 24, "README.md's allowlist tables: their rows (6 core, 9 fs, 9 net)");
+    assert_eq!(lines.len(), 24, "the allowlist tables (README.md, src/plugin/README.md): their rows (6 core, 9 fs, 9 net)");
 }
 
 /// The program's length in each mode and plugin choice (the kernel takes 4096).
@@ -378,22 +379,28 @@ fn close_row() {
 #[test]
 fn openat_row() {
     let o = |flags: i32, mode: u64| call(libc::SYS_openat, [N, 0x1000, (flags | libc::O_NONBLOCK | libc::O_CLOEXEC) as u64, mode, 0, 0]);
-    // Read-only: RDONLY with DIRECTORY, NOFOLLOW; in both fs modes.
-    for f in [0, libc::O_DIRECTORY, libc::O_NOFOLLOW, libc::O_DIRECTORY | libc::O_NOFOLLOW] {
-        row(RO, &[NONE, NET], o(f, 0), &[0]);
-        assert!(allowed(Fs::ReadWrite, false, &o(f, 0)));
+    // Read-only: RDONLY; in both fs modes.
+    row(RO, &[NONE, NET], o(0, 0), &[0]);
+    assert!(allowed(Fs::ReadWrite, false, &o(0, 0)));
+    // Read-write only: RDWR, with CREAT, with CREAT | EXCL.
+    for f in [libc::O_RDWR, libc::O_RDWR | libc::O_CREAT, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL] {
+        row(RW, &[NONE, RO, NET], o(f, 0o644), &[0]);
     }
-    // Read-write only.
+    // Never, in either mode: the flags the runtime doesn't use (a truncation is ftruncate, an
+    // append the guest's offset, a write-only open a read-write one).
     for f in [
         libc::O_WRONLY,
+        libc::O_DIRECTORY,
+        libc::O_NOFOLLOW,
         libc::O_RDWR | libc::O_TRUNC,
         libc::O_WRONLY | libc::O_APPEND,
-        libc::O_RDWR | libc::O_CREAT,
-        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        libc::O_RDWR | libc::O_APPEND,
         libc::O_CREAT,
-        libc::O_RDWR | libc::O_CREAT | libc::O_APPEND,
+        libc::O_WRONLY | libc::O_CREAT,
+        libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
     ] {
-        row(RW, &[NONE, RO, NET], o(f, 0o644), &[0]);
+        assert!(!allowed(Fs::ReadOnly, false, &o(f, 0o644)), "{f:#o} read-only");
+        assert!(!allowed(Fs::ReadWrite, false, &o(f, 0o644)), "{f:#o} read-write");
     }
     // Never: without O_NONBLOCK or O_CLOEXEC, O_PATH, O_TMPFILE, O_DIRECT, an unknown bit; a mode
     // with S_ISUID or S_ISGID.
@@ -411,7 +418,7 @@ fn openat_row() {
         }
         refused(on, o(0, 0), 3, &[0o4644, 0o2755, u64::MAX]);
     }
-    assert!(allowed(Fs::ReadWrite, false, &o(libc::O_CREAT | libc::O_WRONLY, 0o1777)));
+    assert!(allowed(Fs::ReadWrite, false, &o(libc::O_CREAT | libc::O_RDWR, 0o1777)));
 }
 
 #[test]

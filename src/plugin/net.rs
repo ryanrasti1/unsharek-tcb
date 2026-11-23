@@ -4,9 +4,9 @@
 
 use libc::seccomp_data;
 use seccomp_fn_verify::calls::{Call, CallExt};
-use seccomp_fn_verify::expr::Cond;
+use seccomp_fn_verify::tree::C;
 
-use super::Plugin;
+use super::{Fs, Plugin, Rows};
 
 // The rows' constants, libc's, as the typed view's fields have them (each an `int`).
 const AF_INET: i32 = libc::AF_INET;
@@ -36,8 +36,8 @@ impl Net {
 }
 
 impl Plugin for Net {
-    fn rows(&self, n: u32) -> Option<Cond> {
-        Some(rows(n))
+    fn rows(&self) -> Rows {
+        Rows { fs: Fs::Off, net: true }
     }
 }
 
@@ -97,7 +97,11 @@ pub(crate) fn sockets(d: &seccomp_data, n: u32) -> bool {
     }
 }
 
-/// [`sockets`]'s rows, as the combinator's sub-filter (`crate::filter`).
-pub(crate) fn rows(n: u32) -> Cond {
-    seccomp_fn::rows!(sockets(d, n))
+/// The plugin's rows when `net` enables them.
+pub(crate) fn enabled(d: &seccomp_data, n: u32, net: bool) -> bool {
+    net && sockets(d, n)
 }
+
+/// [`enabled`]'s rows, as the combinator's sub-filter (`crate::filter::TREE`), over the filter's
+/// params (`crate::filter::filter`'s, by position).
+pub(crate) const ROWS: C = seccomp_fn::rows!(enabled(d, n as u32, net) in (mode, n, gate, fs, net));
