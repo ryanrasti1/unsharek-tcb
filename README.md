@@ -48,7 +48,7 @@ The guarantee is achieved by `unsharek_tcb::lockdown(config, plugins)`, which us
 1. Checking that the kept fds are exactly `0..n` (`Config::grant`; a gap refused), each open; putting them there is the caller's (its `dup2`s, untrusted)
 2. Closing every fd at or above `n`
 3. Disabling core dumps (`RLIMIT_CORE` 0, not dumpable): a crash must not write memory to the host's disk, or start `core_pattern`'s helper
-4. Dropping all capabilities, and setting `no_new_privs`; then each plugin's setup (the file plugin's Landlock ruleset)
+4. Setting `no_new_privs`; then each plugin's setup (the file plugin's Landlock ruleset)
 5. Enabling the configured seccomp filter, on every thread (`TSYNC`)
 
 **Paranoia** (`src/paranoia.rs`, `Config::paranoia`, on by default) is best-effort: lockdown can look at these, not enforce them, so none is a guarantee. Before step 2:
@@ -57,7 +57,7 @@ The guarantee is achieved by `unsharek_tcb::lockdown(config, plugins)`, which us
    - all mappings private, read-only, or anonymous shared (fork mode)
    - no tracer, no other process sharing the memory, no ancestor mapping the shared memory
 
-and after step 4, no capability left. Lockdown takes the caller's declarations as given: it checks no fd's kind against the mode.
+and at step 4, every capability dropped, then checked gone. Lockdown takes the caller's declarations as given: it checks no fd's kind against the mode.
 
 Nothing untrusted has run if lockdown fails: the caller reports the error.
 
@@ -74,4 +74,4 @@ The filter is seccomp-fn-verify's combinator (`gated!`) of the core's rows (`cor
 | fd floor | `src/lockdown.rs` | everything at or above `n` closed; every plugin row's fd and dirfd `>= n`, no `AT_EMPTY_PATH` |
 | plugins | `src/plugin.rs`, `src/plugin/*.rs` | rows only after the core's (after the arch and gate checks), allow or no match; each file exports only its `Plugin` impl |
 | roots (plugin: fs) | `src/plugin/fs.rs` | Landlock ruleset of the roots, after `no_new_privs`, before the filter; refused without Landlock or its needed ABI unless `no_landlock` |
-| core dumps, capabilities, `no_new_privs` | `src/lockdown.rs` | set before the filter |
+| core dumps, `no_new_privs` | `src/lockdown.rs` | set before the filter |

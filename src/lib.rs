@@ -51,7 +51,7 @@
 //!   userfaultfd, …).
 //!
 //! **Paranoia** ([`Config::paranoia`], on by default; paranoia.rs) is a best-effort check of
-//! those assumptions, before the rest, and of the capabilities after they are dropped: it reads
+//! those assumptions, before the rest, and drops the capabilities, checking them gone: it reads
 //! `/proc` (its own entries, and other processes' it may), so it costs time in proportion to the
 //! host's processes.
 //!
@@ -162,7 +162,7 @@ impl Config {
 
     /// Whether lockdown checks its assumptions, best-effort (the crate's "Assumptions": one
     /// thread, each kept fd's kind, the mappings, a tracer, another process sharing the memory,
-    /// shared memory an ancestor maps; and after dropping them, that no capability remains). On
+    /// shared memory an ancestor maps; and it drops every capability, then checks none remains). On
     /// by default; off saves its time: none of it is a guarantee.
     pub fn paranoia(mut self, on: bool) -> Self {
         self.paranoia = on;
@@ -230,16 +230,15 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// 2. every fd at or above `n` closed (not refused: a CLI inherits stray fds);
 /// 3. no core dump (`RLIMIT_CORE` 0) and not dumpable (`PR_SET_DUMPABLE` 0): a crash makes the
 ///    host write none of the process's memory, nor start `core_pattern`'s helper;
-/// 4. every capability dropped (bounding where permitted, ambient, effective, permitted,
-///    inheritable), then `no_new_privs`;
+/// 4. `no_new_privs`;
 /// 5. each plugin's [`Plugin::setup`] (the file plugin's Landlock ruleset of its roots);
 /// 6. the filter ([`filter`]: the core's rows, then the plugins', its floor `n`), with TSYNC.
 ///
 /// With [`Config::paranoia`] (on by default), best-effort, before step 2: one thread (through one
 /// fd of `/proc/self`, checked to be procfs), each kept fd of its declared kind ([`Expect`]) and
 /// of no kind refused, every mapping private, read-only or (fork mode) shared anonymous memory,
-/// no tracer, no other process sharing the memory, no ancestor's shared memory; and after step 4,
-/// no capability left.
+/// no tracer, no other process sharing the memory, no ancestor's shared memory; and at step 4,
+/// every capability dropped, then checked gone.
 ///
 /// `plugins` (experimental) widen the sandbox, each only when passed ([`plugin`]): their
 /// [`Plugin::check`]s run first, before anything changes; their kept fds are kept as grants are.
